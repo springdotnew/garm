@@ -62,6 +62,7 @@ func NewWorker(ctx context.Context, store dbCommon.Store, scaleSet params.ScaleS
 		scaleSet:       scaleSet,
 		entity:         entity,
 		runners:        make(map[string]params.Instance),
+		autoScaleWake:  make(chan struct{}, 1),
 	}, nil
 }
 
@@ -78,7 +79,8 @@ type Worker struct {
 
 	consumer dbCommon.Consumer
 
-	listener *scaleSetListener
+	listener      *scaleSetListener
+	autoScaleWake chan struct{}
 
 	mux     sync.Mutex
 	running bool
@@ -671,6 +673,7 @@ func (w *Worker) handleScaleSetEvent(event dbCommon.ChangePayload) {
 		}
 		w.scaleSet = scaleSet
 		w.mux.Unlock()
+		w.signalAutoScale()
 	default:
 		slog.DebugContext(w.ctx, "invalid operation type; ignoring", "operation_type", event.Operation)
 	}
@@ -1035,6 +1038,13 @@ func (w *Worker) runnerCount() int {
 	return count
 }
 
+func (w *Worker) signalAutoScale() {
+	select {
+	case w.autoScaleWake <- struct{}{}:
+	default:
+	}
+}
+
 func (w *Worker) handleAutoScale() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -1065,27 +1075,29 @@ func (w *Worker) handleAutoScale() {
 		case <-w.ctx.Done():
 			return
 		case <-ticker.C:
-			w.mux.Lock()
-			for _, instance := range w.runners {
-				if err := w.handleInstanceCleanup(instance); err != nil {
-					slog.ErrorContext(w.ctx, "error cleaning up instance", "instance_id", instance.ID, "error", err)
-				}
-			}
-
-			if w.runnerCount() == w.targetRunners() {
-				lastMsgDebugLog("desired runner count reached", w.targetRunners(), w.runnerCount())
-				w.mux.Unlock()
-				continue
-			}
-
-			if w.runnerCount() < w.targetRunners() {
-				lastMsgDebugLog("scaling up", w.targetRunners(), w.runnerCount())
-				w.handleScaleUp()
-			} else {
-				lastMsgDebugLog("attempting to scale down", w.targetRunners(), w.runnerCount())
-				w.handleScaleDown()
-			}
-			w.mux.Unlock()
+		case <-w.autoScaleWake:
 		}
+
+		w.mux.Lock()
+		for _, instance := range w.runners {
+			if err := w.handleInstanceCleanup(instance); err != nil {
+				slog.ErrorContext(w.ctx, "error cleaning up instance", "instance_id", instance.ID, "error", err)
+			}
+		}
+
+		if w.runnerCount() == w.targetRunners() {
+			lastMsgDebugLog("desired runner count reached", w.targetRunners(), w.runnerCount())
+			w.mux.Unlock()
+			continue
+		}
+
+		if w.runnerCount() < w.targetRunners() {
+			lastMsgDebugLog("scaling up", w.targetRunners(), w.runnerCount())
+			w.handleScaleUp()
+		} else {
+			lastMsgDebugLog("attempting to scale down", w.targetRunners(), w.runnerCount())
+			w.handleScaleDown()
+		}
+		w.mux.Unlock()
 	}
 }

@@ -14,9 +14,11 @@
 package scaleset
 
 import (
+	"context"
 	"testing"
 
 	commonParams "github.com/cloudbase/garm-provider-common/params"
+	dbCommon "github.com/cloudbase/garm/database/common"
 	"github.com/cloudbase/garm/params"
 )
 
@@ -33,5 +35,27 @@ func TestRunnerCountExcludesInstancesBeingDeleted(t *testing.T) {
 
 	if got, want := w.runnerCount(), 1; got != want {
 		t.Fatalf("runnerCount() = %d, want %d", got, want)
+	}
+}
+
+func TestScaleSetUpdateWakesAutoscaler(t *testing.T) {
+	w := &Worker{
+		ctx:           context.Background(),
+		scaleSet:      params.ScaleSet{ID: 1, Enabled: true, MaxRunners: 8},
+		autoScaleWake: make(chan struct{}, 1),
+	}
+	updated := w.scaleSet
+	updated.DesiredRunnerCount = 8
+
+	w.handleScaleSetEvent(dbCommon.ChangePayload{
+		EntityType: dbCommon.ScaleSetEntityType,
+		Operation:  dbCommon.UpdateOperation,
+		Payload:    updated,
+	})
+
+	select {
+	case <-w.autoScaleWake:
+	default:
+		t.Fatal("scale set update did not wake autoscaler")
 	}
 }
