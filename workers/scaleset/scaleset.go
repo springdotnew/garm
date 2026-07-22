@@ -35,6 +35,8 @@ import (
 	garmUtil "github.com/cloudbase/garm/util"
 )
 
+const scaleDownIdleGrace = 30 * time.Second
+
 func NewWorker(ctx context.Context, store dbCommon.Store, scaleSet params.ScaleSet, provider common.Provider) (*Worker, error) {
 	consumerID := fmt.Sprintf("scaleset-worker-%s-%d", scaleSet.Name, scaleSet.ID)
 	controllerInfo, err := store.ControllerInfo()
@@ -955,9 +957,8 @@ func (w *Worker) handleScaleDown() {
 		}
 		switch runner.Status {
 		case commonParams.InstanceRunning:
-			switch runner.RunnerStatus {
-			case params.RunnerTerminated, params.RunnerActive, params.RunnerPending:
-				slog.DebugContext(w.ctx, "runner is not in a valid state; skipping", "runner_name", runner.Name, "runner_status", runner.RunnerStatus)
+			if !runnerCanScaleDown(runner, time.Now()) {
+				slog.DebugContext(w.ctx, "runner is not ready for scale down; skipping", "runner_name", runner.Name, "runner_status", runner.RunnerStatus)
 				continue
 			}
 			locked := locking.TryLock(runner.Name, w.consumerID)
@@ -1012,13 +1013,19 @@ func (w *Worker) handleScaleDown() {
 			removed++
 		case commonParams.InstancePendingDelete, commonParams.InstancePendingForceDelete,
 			commonParams.InstanceDeleting, commonParams.InstanceDeleted:
-			removed++
 			continue
 		default:
 			slog.WarnContext(w.ctx, "runner is not in a valid state; skipping", "runner_name", runner.Name, "runner_status", runner.Status)
 			continue
 		}
 	}
+}
+
+func runnerCanScaleDown(runner params.Instance, now time.Time) bool {
+	if runner.Status != commonParams.InstanceRunning || runner.RunnerStatus != params.RunnerIdle {
+		return false
+	}
+	return runner.UpdatedAt.IsZero() || !now.Before(runner.UpdatedAt.Add(scaleDownIdleGrace))
 }
 
 func (w *Worker) targetRunners() int {

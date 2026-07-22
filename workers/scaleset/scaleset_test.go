@@ -16,6 +16,7 @@ package scaleset
 import (
 	"context"
 	"testing"
+	"time"
 
 	commonParams "github.com/cloudbase/garm-provider-common/params"
 	dbCommon "github.com/cloudbase/garm/database/common"
@@ -38,6 +39,49 @@ func TestRunnerCountOnlyIncludesCapacityAvailableForAssignedJobs(t *testing.T) {
 
 	if got, want := w.runnerCount(), 2; got != want {
 		t.Fatalf("runnerCount() = %d, want %d", got, want)
+	}
+}
+
+func TestRunnerCanScaleDownOnlyAfterIdleGrace(t *testing.T) {
+	now := time.Date(2026, time.July, 22, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		runner params.Instance
+		want   bool
+	}{
+		{
+			name:   "idle past grace",
+			runner: params.Instance{Status: commonParams.InstanceRunning, RunnerStatus: params.RunnerIdle, UpdatedAt: now.Add(-scaleDownIdleGrace)},
+			want:   true,
+		},
+		{
+			name:   "idle within grace",
+			runner: params.Instance{Status: commonParams.InstanceRunning, RunnerStatus: params.RunnerIdle, UpdatedAt: now.Add(-scaleDownIdleGrace + time.Second)},
+		},
+		{
+			name:   "installing",
+			runner: params.Instance{Status: commonParams.InstanceRunning, RunnerStatus: params.RunnerInstalling, UpdatedAt: now.Add(-time.Minute)},
+		},
+		{
+			name:   "pending",
+			runner: params.Instance{Status: commonParams.InstanceRunning, RunnerStatus: params.RunnerPending, UpdatedAt: now.Add(-time.Minute)},
+		},
+		{
+			name:   "active",
+			runner: params.Instance{Status: commonParams.InstanceRunning, RunnerStatus: params.RunnerActive, UpdatedAt: now.Add(-time.Minute)},
+		},
+		{
+			name:   "deleting",
+			runner: params.Instance{Status: commonParams.InstanceDeleting, RunnerStatus: params.RunnerIdle, UpdatedAt: now.Add(-time.Minute)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := runnerCanScaleDown(tt.runner, now); got != tt.want {
+				t.Fatalf("runnerCanScaleDown() = %t, want %t", got, tt.want)
+			}
+		})
 	}
 }
 
