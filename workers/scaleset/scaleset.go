@@ -1025,7 +1025,14 @@ func (w *Worker) targetRunners() int {
 }
 
 func (w *Worker) runnerCount() int {
-	return len(w.runners)
+	count := 0
+	for _, runner := range w.runners {
+		if garmErrors.InstanceIsBeingDeleted(runner.Status) {
+			continue
+		}
+		count++
+	}
+	return count
 }
 
 func (w *Worker) handleAutoScale() {
