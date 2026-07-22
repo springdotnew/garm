@@ -33,6 +33,7 @@ import (
 	"github.com/cloudbase/garm/params"
 	"github.com/cloudbase/garm/runner/common"
 	garmUtil "github.com/cloudbase/garm/util"
+	"github.com/cloudbase/garm/util/github/scalesets"
 )
 
 const (
@@ -84,8 +85,9 @@ type Worker struct {
 
 	consumer dbCommon.Consumer
 
-	listener      *scaleSetListener
-	autoScaleWake chan struct{}
+	listener          *scaleSetListener
+	autoScaleWake     chan struct{}
+	creationsInFlight int
 
 	mux     sync.Mutex
 	running bool
@@ -866,7 +868,9 @@ func (w *Worker) handleScaleUp() {
 		return
 	}
 
-	if w.targetRunners() <= w.runnerCount() {
+	currentRunners := w.runnerCount()
+	creationsToStart := runnerCreationsToStart(w.targetRunners(), currentRunners, w.creationsInFlight)
+	if creationsToStart == 0 {
 		slog.DebugContext(w.ctx, "target is less than or equal to current; not scaling up")
 		return
 	}
@@ -882,77 +886,122 @@ func (w *Worker) handleScaleUp() {
 		slog.ErrorContext(w.ctx, "error getting scale set client", "error", err)
 		return
 	}
-	missingRunners := w.targetRunners() - w.runnerCount()
-	createdRunners := runRunnerCreationsConcurrently(missingRunners, func() (params.Instance, bool) {
-		newRunnerName := strings.ToLower(fmt.Sprintf("%s-%s", w.scaleSet.GetRunnerPrefix(), util.NewID()))
-		jitConfig, err := scaleSetCli.GenerateJitRunnerConfig(w.ctx, newRunnerName, w.scaleSet.ScaleSetID)
-		if err != nil {
-			slog.ErrorContext(w.ctx, "error generating jit config", "error", err)
-			return params.Instance{}, false
-		}
-		slog.DebugContext(w.ctx, "creating new runner", "runner_name", newRunnerName)
-		decodedJit, err := jitConfig.DecodedJITConfig()
-		if err != nil {
-			slog.ErrorContext(w.ctx, "error decoding jit config", "error", err)
-			return params.Instance{}, false
-		}
-		runnerParams := params.CreateInstanceParams{
-			Name:              newRunnerName,
-			Status:            commonParams.InstancePendingCreate,
-			RunnerStatus:      params.RunnerPending,
-			OSArch:            w.scaleSet.OSArch,
-			OSType:            w.scaleSet.OSType,
-			CallbackURL:       controllerConfig.CallbackURL,
-			MetadataURL:       controllerConfig.MetadataURL,
-			CreateAttempt:     1,
-			GitHubRunnerGroup: w.scaleSet.GitHubRunnerGroup,
-			JitConfiguration:  decodedJit,
-			AgentID:           jitConfig.Runner.ID,
-		}
 
-		dbInstance, err := w.store.CreateScaleSetInstance(w.ctx, w.scaleSet.ID, runnerParams)
-		if err != nil {
-			slog.ErrorContext(w.ctx, "error creating instance", "error", err)
-			if err := scaleSetCli.RemoveRunner(w.ctx, jitConfig.Runner.ID); err != nil {
-				slog.ErrorContext(w.ctx, "error deleting runner", "error", err)
-			}
-			return params.Instance{}, false
-		}
-		return dbInstance, true
+	scaleSet := w.scaleSet
+	workerQuit := w.quit
+	w.creationsInFlight += creationsToStart
+	slog.InfoContext(
+		w.ctx,
+		"scheduling runner creations",
+		"count", creationsToStart,
+		"current_runners", currentRunners,
+		"in_flight", w.creationsInFlight,
+		"target_runners", w.targetRunners(),
+	)
+	startRunnerCreations(creationsToStart, func() {
+		w.createScaleSetRunner(controllerConfig, scaleSet, scaleSetCli, workerQuit)
 	})
-	for _, dbInstance := range createdRunners {
-		w.runners[dbInstance.ID] = dbInstance
+}
+
+func runnerCreationsToStart(target, current, inFlight int) int {
+	needed := target - current - inFlight
+	availableSlots := maxConcurrentRunnerCreations - inFlight
+	if needed <= 0 || availableSlots <= 0 {
+		return 0
+	}
+	return min(needed, availableSlots)
+}
+
+func startRunnerCreations(count int, create func()) {
+	for range count {
+		go create()
 	}
 }
 
-func runRunnerCreationsConcurrently(count int, create func() (params.Instance, bool)) []params.Instance {
-	created := make(chan params.Instance, count)
-	jobs := make(chan struct{}, count)
-	for range count {
-		jobs <- struct{}{}
-	}
-	close(jobs)
+func (w *Worker) createScaleSetRunner(
+	controllerConfig params.ControllerInfo,
+	scaleSet params.ScaleSet,
+	scaleSetCli *scalesets.ScaleSetClient,
+	workerQuit <-chan struct{},
+) {
+	var dbInstance params.Instance
+	created := false
+	defer func() {
+		w.mux.Lock()
+		w.creationsInFlight--
+		if created {
+			w.runners[dbInstance.ID] = dbInstance
+		}
+		w.mux.Unlock()
+		if created {
+			w.signalAutoScale()
+		}
+	}()
 
-	var group sync.WaitGroup
-	for range min(count, maxConcurrentRunnerCreations) {
-		group.Add(1)
-		go func() {
-			defer group.Done()
-			for range jobs {
-				if instance, ok := create(); ok {
-					created <- instance
-				}
-			}
-		}()
+	newRunnerName := strings.ToLower(fmt.Sprintf("%s-%s", scaleSet.GetRunnerPrefix(), util.NewID()))
+	jitConfig, err := scaleSetCli.GenerateJitRunnerConfig(w.ctx, newRunnerName, scaleSet.ScaleSetID)
+	if err != nil {
+		slog.ErrorContext(w.ctx, "error generating jit config", "error", err)
+		return
 	}
-	group.Wait()
-	close(created)
+	slog.DebugContext(w.ctx, "creating new runner", "runner_name", newRunnerName)
+	decodedJit, err := jitConfig.DecodedJITConfig()
+	if err != nil {
+		slog.ErrorContext(w.ctx, "error decoding jit config", "error", err)
+		if err := scaleSetCli.RemoveRunner(w.ctx, jitConfig.Runner.ID); err != nil {
+			slog.ErrorContext(w.ctx, "error deleting runner", "error", err)
+		}
+		return
+	}
 
-	instances := make([]params.Instance, 0, count)
-	for instance := range created {
-		instances = append(instances, instance)
+	runnerParams := params.CreateInstanceParams{
+		Name:              newRunnerName,
+		Status:            commonParams.InstancePendingCreate,
+		RunnerStatus:      params.RunnerPending,
+		OSArch:            scaleSet.OSArch,
+		OSType:            scaleSet.OSType,
+		CallbackURL:       controllerConfig.CallbackURL,
+		MetadataURL:       controllerConfig.MetadataURL,
+		CreateAttempt:     1,
+		GitHubRunnerGroup: scaleSet.GitHubRunnerGroup,
+		JitConfiguration:  decodedJit,
+		AgentID:           jitConfig.Runner.ID,
 	}
-	return instances
+
+	// JIT generation can block long enough for more job messages, a max-runner
+	// reduction, or a disable to arrive. Keep that control path unblocked, then
+	// commit this reservation only if it is still part of the current target.
+	w.mux.Lock()
+	if !w.runnerCreationStillNeeded(scaleSet.ID, workerQuit) {
+		w.mux.Unlock()
+		if err := scaleSetCli.RemoveRunner(w.ctx, jitConfig.Runner.ID); err != nil {
+			slog.ErrorContext(w.ctx, "error deleting runner", "error", err)
+		}
+		return
+	}
+	dbInstance, err = w.store.CreateScaleSetInstance(w.ctx, scaleSet.ID, runnerParams)
+	w.mux.Unlock()
+	if err != nil {
+		slog.ErrorContext(w.ctx, "error creating instance", "error", err)
+		if err := scaleSetCli.RemoveRunner(w.ctx, jitConfig.Runner.ID); err != nil {
+			slog.ErrorContext(w.ctx, "error deleting runner", "error", err)
+		}
+		return
+	}
+	created = true
+}
+
+// runnerCreationStillNeeded must be called with w.mux held. creationsInFlight
+// includes the caller's reservation, so target equality means it is needed.
+func (w *Worker) runnerCreationStillNeeded(scaleSetID uint, workerQuit <-chan struct{}) bool {
+	select {
+	case <-workerQuit:
+		return false
+	default:
+	}
+	return w.scaleSet.Enabled &&
+		w.scaleSet.ID == scaleSetID &&
+		w.runnerCount()+w.creationsInFlight <= w.targetRunners()
 }
 
 func (w *Worker) waitForToolsOrCancel() (hasTools, stopped bool) {

@@ -85,37 +85,95 @@ func TestRunnerCanScaleDownOnlyAfterIdleGrace(t *testing.T) {
 	}
 }
 
-func TestRunRunnerCreationsConcurrently(t *testing.T) {
+func TestRunnerCreationsToStart(t *testing.T) {
+	tests := []struct {
+		name          string
+		target        int
+		current       int
+		inFlight      int
+		wantCreations int
+	}{
+		{name: "full burst", target: 8, wantCreations: 8},
+		{name: "demand grows during first wave", target: 8, inFlight: 6, wantCreations: 2},
+		{name: "existing and in flight satisfy target", target: 8, current: 5, inFlight: 3},
+		{name: "concurrency cap", target: 20, wantCreations: 8},
+		{name: "one slot remains", target: 20, current: 11, inFlight: 7, wantCreations: 1},
+		{name: "target decreased", target: 4, current: 4, inFlight: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := runnerCreationsToStart(tt.target, tt.current, tt.inFlight); got != tt.wantCreations {
+				t.Fatalf("runnerCreationsToStart() = %d, want %d", got, tt.wantCreations)
+			}
+		})
+	}
+}
+
+func TestStartRunnerCreationsDoesNotWaitForFirstWave(t *testing.T) {
 	const runnerCount = 8
 	started := make(chan struct{}, runnerCount)
 	release := make(chan struct{})
-	done := make(chan []params.Instance, 1)
 
-	go func() {
-		done <- runRunnerCreationsConcurrently(runnerCount, func() (params.Instance, bool) {
-			started <- struct{}{}
-			<-release
-			return params.Instance{ID: "created"}, true
-		})
-	}()
+	startRunnerCreations(runnerCount, func() {
+		started <- struct{}{}
+		<-release
+	})
 
 	for range runnerCount {
 		select {
 		case <-started:
 		case <-time.After(time.Second):
 			close(release)
-			t.Fatal("runner creations did not fan out concurrently")
+			t.Fatal("runner creations did not fan out without waiting for the first wave")
 		}
 	}
 	close(release)
+}
 
-	select {
-	case instances := <-done:
-		if len(instances) != runnerCount {
-			t.Fatalf("created %d runners, want %d", len(instances), runnerCount)
+func TestRunnerCreationStillNeededFailsClosed(t *testing.T) {
+	newWorker := func() *Worker {
+		return &Worker{
+			scaleSet: params.ScaleSet{
+				ID:                 1,
+				Enabled:            true,
+				MaxRunners:         8,
+				DesiredRunnerCount: 8,
+			},
+			runners:           make(map[string]params.Instance),
+			creationsInFlight: 8,
+			quit:              make(chan struct{}),
 		}
-	case <-time.After(time.Second):
-		t.Fatal("concurrent runner creations did not finish")
+	}
+
+	w := newWorker()
+	if !w.runnerCreationStillNeeded(1, w.quit) {
+		t.Fatal("exactly reserved creation was rejected")
+	}
+
+	w = newWorker()
+	w.scaleSet.DesiredRunnerCount = 7
+	if w.runnerCreationStillNeeded(1, w.quit) {
+		t.Fatal("creation survived a target decrease")
+	}
+
+	w = newWorker()
+	w.scaleSet.Enabled = false
+	if w.runnerCreationStillNeeded(1, w.quit) {
+		t.Fatal("creation survived scale-set disable")
+	}
+
+	w = newWorker()
+	if w.runnerCreationStillNeeded(2, w.quit) {
+		t.Fatal("creation survived scale-set replacement")
+	}
+
+	w = newWorker()
+	workerQuit := w.quit
+	close(workerQuit)
+	w.quit = make(chan struct{})
+	if w.runnerCreationStillNeeded(1, workerQuit) {
+		t.Fatal("creation survived its worker generation stopping")
 	}
 }
 
