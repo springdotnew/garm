@@ -22,6 +22,10 @@ func TestKnownBootstrapStage(t *testing.T) {
 		"downloading JIT credentials":                              "jit-credentials",
 		"generating systemd unit file":                             "systemd-unit",
 		"enabling runner service":                                  "systemd-enable",
+		"runner service started":                                   "service-started",
+		"runner listener connect retry":                            "listener-connect-retry",
+		"runner listener ready":                                    "listener-ready",
+		"runner listener readiness timeout":                        "listener-ready-timeout",
 		"runner successfully installed":                            "installed",
 		"failed to configure runner: secret-bearing provider text": "",
 	}

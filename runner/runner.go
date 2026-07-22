@@ -1144,6 +1144,14 @@ func knownBootstrapStage(message string) string {
 		return "systemd-unit"
 	case message == "enabling runner service":
 		return "systemd-enable"
+	case message == "runner service started":
+		return "service-started"
+	case message == "runner listener connect retry":
+		return "listener-connect-retry"
+	case message == "runner listener ready":
+		return "listener-ready"
+	case message == "runner listener readiness timeout":
+		return "listener-ready-timeout"
 	case message == "runner successfully installed":
 		return "installed"
 	default:
