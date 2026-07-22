@@ -658,6 +658,7 @@ func (w *Worker) handleScaleSetEvent(event dbCommon.ChangePayload) {
 	case dbCommon.UpdateOperation:
 		slog.DebugContext(w.ctx, "got update operation")
 		w.mux.Lock()
+		previousTarget := w.targetRunners()
 
 		if scaleSet.MaxRunners < w.scaleSet.MaxRunners || !scaleSet.Enabled {
 			// we stop the listener if the scale set is disabled or if the max runners
@@ -672,8 +673,11 @@ func (w *Worker) handleScaleSetEvent(event dbCommon.ChangePayload) {
 			}
 		}
 		w.scaleSet = scaleSet
+		targetIncreased := w.targetRunners() > previousTarget
 		w.mux.Unlock()
-		w.signalAutoScale()
+		if targetIncreased {
+			w.signalAutoScale()
+		}
 	default:
 		slog.DebugContext(w.ctx, "invalid operation type; ignoring", "operation_type", event.Operation)
 	}

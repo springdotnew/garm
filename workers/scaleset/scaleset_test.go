@@ -59,3 +59,30 @@ func TestScaleSetUpdateWakesAutoscaler(t *testing.T) {
 		t.Fatal("scale set update did not wake autoscaler")
 	}
 }
+
+func TestScaleSetUpdateDoesNotWakeAutoscalerWhenTargetDecreases(t *testing.T) {
+	w := &Worker{
+		ctx: context.Background(),
+		scaleSet: params.ScaleSet{
+			ID:                 1,
+			Enabled:            true,
+			MaxRunners:         8,
+			DesiredRunnerCount: 8,
+		},
+		autoScaleWake: make(chan struct{}, 1),
+	}
+	updated := w.scaleSet
+	updated.DesiredRunnerCount = 7
+
+	w.handleScaleSetEvent(dbCommon.ChangePayload{
+		EntityType: dbCommon.ScaleSetEntityType,
+		Operation:  dbCommon.UpdateOperation,
+		Payload:    updated,
+	})
+
+	select {
+	case <-w.autoScaleWake:
+		t.Fatal("target decrease unexpectedly woke autoscaler")
+	default:
+	}
+}
