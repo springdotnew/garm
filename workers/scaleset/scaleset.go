@@ -88,10 +88,13 @@ type Worker struct {
 	listener          *scaleSetListener
 	autoScaleWake     chan struct{}
 	creationsInFlight int
+	scaleSetClient    *scalesets.ScaleSetClient
+	scaleSetClientGen uint64
 
-	mux     sync.Mutex
-	running bool
-	quit    chan struct{}
+	mux               sync.Mutex
+	scaleSetClientMux sync.Mutex
+	running           bool
+	quit              chan struct{}
 }
 
 func (w *Worker) ensureScaleSetInGitHub() error {
@@ -926,6 +929,7 @@ func (w *Worker) createScaleSetRunner(
 ) {
 	var dbInstance params.Instance
 	created := false
+	createStarted := time.Now()
 	defer func() {
 		w.mux.Lock()
 		w.creationsInFlight--
@@ -939,11 +943,19 @@ func (w *Worker) createScaleSetRunner(
 	}()
 
 	newRunnerName := strings.ToLower(fmt.Sprintf("%s-%s", scaleSet.GetRunnerPrefix(), util.NewID()))
+	jitStarted := time.Now()
 	jitConfig, err := scaleSetCli.GenerateJitRunnerConfig(w.ctx, newRunnerName, scaleSet.ScaleSetID)
 	if err != nil {
 		slog.ErrorContext(w.ctx, "error generating jit config", "error", err)
 		return
 	}
+	jitDuration := time.Since(jitStarted)
+	slog.InfoContext(
+		w.ctx,
+		"generated runner jit config",
+		"runner_name", newRunnerName,
+		"duration", jitDuration,
+	)
 	slog.DebugContext(w.ctx, "creating new runner", "runner_name", newRunnerName)
 	decodedJit, err := jitConfig.DecodedJITConfig()
 	if err != nil {
@@ -979,6 +991,7 @@ func (w *Worker) createScaleSetRunner(
 		}
 		return
 	}
+	dbStarted := time.Now()
 	dbInstance, err = w.store.CreateScaleSetInstance(w.ctx, scaleSet.ID, runnerParams)
 	w.mux.Unlock()
 	if err != nil {
@@ -989,6 +1002,14 @@ func (w *Worker) createScaleSetRunner(
 		return
 	}
 	created = true
+	slog.InfoContext(
+		w.ctx,
+		"committed runner creation",
+		"runner_name", newRunnerName,
+		"jit_duration", jitDuration,
+		"db_duration", time.Since(dbStarted),
+		"total_duration", time.Since(createStarted),
+	)
 }
 
 // runnerCreationStillNeeded must be called with w.mux held. creationsInFlight

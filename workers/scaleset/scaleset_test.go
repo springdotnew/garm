@@ -15,13 +15,75 @@ package scaleset
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
 	commonParams "github.com/cloudbase/garm-provider-common/params"
+	"github.com/cloudbase/garm/cache"
 	dbCommon "github.com/cloudbase/garm/database/common"
 	"github.com/cloudbase/garm/params"
+	commonMocks "github.com/cloudbase/garm/runner/common/mocks"
+	githubScaleSets "github.com/cloudbase/garm/util/github/scalesets"
 )
+
+func TestGetScaleSetClientReusesCurrentCacheGeneration(t *testing.T) {
+	const entityID = "entity-id"
+	githubClient := commonMocks.NewGithubClient(t)
+	cache.SetGithubClient(entityID, githubClient)
+	t.Cleanup(func() { cache.DeleteGithubClient(entityID) })
+
+	w := &Worker{scaleSet: params.ScaleSet{OrgID: entityID}}
+	const callers = 16
+	clients := make(chan *githubScaleSets.ScaleSetClient, callers)
+	var callersDone sync.WaitGroup
+	callersDone.Add(callers)
+	for range callers {
+		go func() {
+			defer callersDone.Done()
+			client, err := w.GetScaleSetClient()
+			if err != nil {
+				t.Errorf("GetScaleSetClient() error = %v", err)
+				return
+			}
+			clients <- client
+		}()
+	}
+	callersDone.Wait()
+	close(clients)
+
+	var first *githubScaleSets.ScaleSetClient
+	for client := range clients {
+		if first == nil {
+			first = client
+			continue
+		}
+		if client != first {
+			t.Fatal("concurrent callers received different scale-set clients")
+		}
+	}
+}
+
+func TestGetScaleSetClientRebuildsAfterGithubClientReplacement(t *testing.T) {
+	const entityID = "entity-id"
+	cache.SetGithubClient(entityID, commonMocks.NewGithubClient(t))
+	t.Cleanup(func() { cache.DeleteGithubClient(entityID) })
+
+	w := &Worker{scaleSet: params.ScaleSet{OrgID: entityID}}
+	first, err := w.GetScaleSetClient()
+	if err != nil {
+		t.Fatalf("GetScaleSetClient() error = %v", err)
+	}
+
+	cache.SetGithubClient(entityID, commonMocks.NewGithubClient(t))
+	second, err := w.GetScaleSetClient()
+	if err != nil {
+		t.Fatalf("GetScaleSetClient() after replacement error = %v", err)
+	}
+	if second == first {
+		t.Fatal("GitHub client replacement reused stale scale-set client")
+	}
+}
 
 func TestRunnerCountIncludesActiveButNotTerminatedCapacity(t *testing.T) {
 	w := &Worker{

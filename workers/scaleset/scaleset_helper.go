@@ -34,16 +34,24 @@ func (w *Worker) GetScaleSetClient() (*scalesets.ScaleSetClient, error) {
 		return nil, fmt.Errorf("getting entity: %w", err)
 	}
 
-	ghCli, ok := cache.GetGithubClient(scaleSetEntity.ID)
+	w.scaleSetClientMux.Lock()
+	defer w.scaleSetClientMux.Unlock()
+
+	ghCli, generation, ok := cache.GetGithubClientVersion(scaleSetEntity.ID)
 	if !ok {
-		return nil, fmt.Errorf("getting github client: %w", err)
+		return nil, fmt.Errorf("github client for entity %s is not available", scaleSetEntity.ID)
+	}
+	if w.scaleSetClient != nil && w.scaleSetClientGen == generation {
+		return w.scaleSetClient, nil
 	}
 	scaleSetClient, err := scalesets.NewClient(ghCli)
 	if err != nil {
 		return nil, fmt.Errorf("creating scale set client: %w", err)
 	}
 
-	return scaleSetClient, nil
+	w.scaleSetClient = scaleSetClient
+	w.scaleSetClientGen = generation
+	return w.scaleSetClient, nil
 }
 
 func (w *Worker) GetScaleSet() params.ScaleSet {
