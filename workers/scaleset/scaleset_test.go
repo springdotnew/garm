@@ -22,10 +22,13 @@ import (
 	"github.com/cloudbase/garm/params"
 )
 
-func TestRunnerCountExcludesInstancesBeingDeleted(t *testing.T) {
+func TestRunnerCountOnlyIncludesCapacityAvailableForAssignedJobs(t *testing.T) {
 	w := &Worker{
 		runners: map[string]params.Instance{
-			"running":              {Status: commonParams.InstanceRunning},
+			"pending":              {Status: commonParams.InstanceCreating, RunnerStatus: params.RunnerPending},
+			"idle":                 {Status: commonParams.InstanceRunning, RunnerStatus: params.RunnerIdle},
+			"active":               {Status: commonParams.InstanceRunning, RunnerStatus: params.RunnerActive},
+			"terminated":           {Status: commonParams.InstanceRunning, RunnerStatus: params.RunnerTerminated},
 			"pending-delete":       {Status: commonParams.InstancePendingDelete},
 			"pending-force-delete": {Status: commonParams.InstancePendingForceDelete},
 			"deleting":             {Status: commonParams.InstanceDeleting},
@@ -33,7 +36,7 @@ func TestRunnerCountExcludesInstancesBeingDeleted(t *testing.T) {
 		},
 	}
 
-	if got, want := w.runnerCount(), 1; got != want {
+	if got, want := w.runnerCount(), 2; got != want {
 		t.Fatalf("runnerCount() = %d, want %d", got, want)
 	}
 }

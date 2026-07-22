@@ -956,7 +956,7 @@ func (w *Worker) handleScaleDown() {
 		switch runner.Status {
 		case commonParams.InstanceRunning:
 			switch runner.RunnerStatus {
-			case params.RunnerTerminated, params.RunnerActive:
+			case params.RunnerTerminated, params.RunnerActive, params.RunnerPending:
 				slog.DebugContext(w.ctx, "runner is not in a valid state; skipping", "runner_name", runner.Name, "runner_status", runner.RunnerStatus)
 				continue
 			}
@@ -1032,9 +1032,17 @@ func (w *Worker) targetRunners() int {
 }
 
 func (w *Worker) runnerCount() int {
+	// DesiredRunnerCount comes from TotalAssignedJobs, which excludes jobs that
+	// have already started. Count only capacity that can still serve an assigned
+	// job, otherwise each active runner makes a different pending runner appear
+	// to be excess capacity.
 	count := 0
 	for _, runner := range w.runners {
 		if garmErrors.InstanceIsBeingDeleted(runner.Status) {
+			continue
+		}
+		switch runner.RunnerStatus {
+		case params.RunnerActive, params.RunnerTerminated:
 			continue
 		}
 		count++
