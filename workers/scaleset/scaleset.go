@@ -1039,17 +1039,15 @@ func (w *Worker) targetRunners() int {
 }
 
 func (w *Worker) runnerCount() int {
-	// DesiredRunnerCount comes from TotalAssignedJobs, which excludes jobs that
-	// have already started. Count only capacity that can still serve an assigned
-	// job, otherwise each active runner makes a different pending runner appear
-	// to be excess capacity.
+	// Terminated and deleting runners cannot serve the desired jobs. Active
+	// runners still count because GitHub's TotalAssignedJobs includes running
+	// jobs; excluding them causes a replacement to be created for every start.
 	count := 0
 	for _, runner := range w.runners {
 		if garmErrors.InstanceIsBeingDeleted(runner.Status) {
 			continue
 		}
-		switch runner.RunnerStatus {
-		case params.RunnerActive, params.RunnerTerminated:
+		if runner.RunnerStatus == params.RunnerTerminated {
 			continue
 		}
 		count++

@@ -23,7 +23,7 @@ import (
 	"github.com/cloudbase/garm/params"
 )
 
-func TestRunnerCountOnlyIncludesCapacityAvailableForAssignedJobs(t *testing.T) {
+func TestRunnerCountIncludesActiveButNotTerminatedCapacity(t *testing.T) {
 	w := &Worker{
 		runners: map[string]params.Instance{
 			"pending":              {Status: commonParams.InstanceCreating, RunnerStatus: params.RunnerPending},
@@ -37,7 +37,7 @@ func TestRunnerCountOnlyIncludesCapacityAvailableForAssignedJobs(t *testing.T) {
 		},
 	}
 
-	if got, want := w.runnerCount(), 2; got != want {
+	if got, want := w.runnerCount(), 3; got != want {
 		t.Fatalf("runnerCount() = %d, want %d", got, want)
 	}
 }
