@@ -80,11 +80,12 @@ func TestInstanceUpdatesDoNotWaitForProviderCalls(t *testing.T) {
 		require.NoError(t, manager.Stop())
 	})
 
-	consolidated := make(chan error, 1)
-	go func() {
-		consolidated <- manager.consolidateState()
-	}()
-	<-deleteStarted
+	select {
+	case <-deleteStarted:
+	case <-time.After(time.Second):
+		close(releaseDelete)
+		require.FailNow(t, "instance manager waited for the periodic tick before reconciling")
+	}
 
 	update := dbCommon.ChangePayload{
 		EntityType: dbCommon.InstanceEntityType,
@@ -110,5 +111,7 @@ func TestInstanceUpdatesDoNotWaitForProviderCalls(t *testing.T) {
 	}
 
 	close(releaseDelete)
-	require.ErrorIs(t, <-consolidated, ErrInstanceDeleted)
+	require.Eventually(t, func() bool {
+		return !manager.running.Load()
+	}, time.Second, 10*time.Millisecond)
 }

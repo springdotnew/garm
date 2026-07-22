@@ -460,6 +460,10 @@ func (i *instanceManager) updatesLoop() {
 
 func (i *instanceManager) loop() {
 	defer i.Stop()
+	if i.reconcile() {
+		return
+	}
+
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -469,13 +473,22 @@ func (i *instanceManager) loop() {
 		case <-i.ctx.Done():
 			return
 		case <-ticker.C:
-			if err := i.consolidateState(); err != nil {
-				if errors.Is(err, ErrInstanceDeleted) {
-					// instance had been deleted, we can exit the loop.
-					return
-				}
-				slog.ErrorContext(i.ctx, "consolidating state", "error", err)
+			if i.reconcile() {
+				return
 			}
 		}
 	}
+}
+
+// reconcile applies the latest instance state. Running it once before the
+// ticker avoids adding a fixed five-second delay to every provider create.
+func (i *instanceManager) reconcile() bool {
+	if err := i.consolidateState(); err != nil {
+		if errors.Is(err, ErrInstanceDeleted) {
+			// instance had been deleted, we can exit the loop.
+			return true
+		}
+		slog.ErrorContext(i.ctx, "consolidating state", "error", err)
+	}
+	return false
 }
