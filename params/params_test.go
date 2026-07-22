@@ -16,7 +16,14 @@ package params
 
 import (
 	"testing"
+
+	commonParams "github.com/cloudbase/garm-provider-common/params"
+	"github.com/stretchr/testify/require"
 )
+
+func TestCreatingInstanceCanPreserveCompletedJobDeletionIntent(t *testing.T) {
+	require.Contains(t, InstanceStatusTransitions[commonParams.InstanceCreating], commonParams.InstancePendingDelete)
+}
 
 func TestPool_HasRequiredLabels(t *testing.T) {
 	tests := []struct {

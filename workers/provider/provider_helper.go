@@ -14,10 +14,13 @@
 package provider
 
 import (
+	"errors"
 	"fmt"
 
+	runnerErrors "github.com/cloudbase/garm-provider-common/errors"
 	commonParams "github.com/cloudbase/garm-provider-common/params"
 	"github.com/cloudbase/garm/auth"
+	garmErrors "github.com/cloudbase/garm/internal/errors"
 	"github.com/cloudbase/garm/params"
 )
 
@@ -41,7 +44,21 @@ func (p *Provider) updateArgsFromProviderInstance(instanceName string, providerI
 
 	updated, err := p.store.UpdateInstance(p.ctx, instanceName, updateParams)
 	if err != nil {
-		return params.Instance{}, fmt.Errorf("updating instance %s: %w", instanceName, err)
+		var transitionErr *runnerErrors.InstanceTransitionError
+		if !errors.As(err, &transitionErr) || !garmErrors.InstanceIsBeingDeleted(transitionErr.From) {
+			return params.Instance{}, fmt.Errorf("updating instance %s: %w", instanceName, err)
+		}
+
+		// A runner may bootstrap, execute, and finish while CreateInstance is
+		// still waiting for the provider operation to settle. In that case the
+		// job-completed handler has already moved the instance onto the deletion
+		// lane. Persist the provider identity needed for deletion without
+		// overwriting that terminal intent with the provider's running status.
+		updateParams.Status = ""
+		updated, err = p.store.UpdateInstance(p.ctx, instanceName, updateParams)
+		if err != nil {
+			return params.Instance{}, fmt.Errorf("updating completed instance %s provider metadata: %w", instanceName, err)
+		}
 	}
 	return updated, nil
 }
