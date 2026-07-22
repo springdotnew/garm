@@ -85,6 +85,40 @@ func TestRunnerCanScaleDownOnlyAfterIdleGrace(t *testing.T) {
 	}
 }
 
+func TestRunRunnerCreationsConcurrently(t *testing.T) {
+	const runnerCount = 8
+	started := make(chan struct{}, runnerCount)
+	release := make(chan struct{})
+	done := make(chan []params.Instance, 1)
+
+	go func() {
+		done <- runRunnerCreationsConcurrently(runnerCount, func() (params.Instance, bool) {
+			started <- struct{}{}
+			<-release
+			return params.Instance{ID: "created"}, true
+		})
+	}()
+
+	for range runnerCount {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			close(release)
+			t.Fatal("runner creations did not fan out concurrently")
+		}
+	}
+	close(release)
+
+	select {
+	case instances := <-done:
+		if len(instances) != runnerCount {
+			t.Fatalf("created %d runners, want %d", len(instances), runnerCount)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("concurrent runner creations did not finish")
+	}
+}
+
 func TestScaleSetUpdateWakesAutoscaler(t *testing.T) {
 	w := &Worker{
 		ctx:           context.Background(),

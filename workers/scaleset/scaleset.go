@@ -35,7 +35,10 @@ import (
 	garmUtil "github.com/cloudbase/garm/util"
 )
 
-const scaleDownIdleGrace = 30 * time.Second
+const (
+	maxConcurrentRunnerCreations = 8
+	scaleDownIdleGrace           = 30 * time.Second
+)
 
 func NewWorker(ctx context.Context, store dbCommon.Store, scaleSet params.ScaleSet, provider common.Provider) (*Worker, error) {
 	consumerID := fmt.Sprintf("scaleset-worker-%s-%d", scaleSet.Name, scaleSet.ID)
@@ -879,18 +882,19 @@ func (w *Worker) handleScaleUp() {
 		slog.ErrorContext(w.ctx, "error getting scale set client", "error", err)
 		return
 	}
-	for i := w.runnerCount(); i < w.targetRunners(); i++ {
+	missingRunners := w.targetRunners() - w.runnerCount()
+	createdRunners := runRunnerCreationsConcurrently(missingRunners, func() (params.Instance, bool) {
 		newRunnerName := strings.ToLower(fmt.Sprintf("%s-%s", w.scaleSet.GetRunnerPrefix(), util.NewID()))
 		jitConfig, err := scaleSetCli.GenerateJitRunnerConfig(w.ctx, newRunnerName, w.scaleSet.ScaleSetID)
 		if err != nil {
 			slog.ErrorContext(w.ctx, "error generating jit config", "error", err)
-			continue
+			return params.Instance{}, false
 		}
 		slog.DebugContext(w.ctx, "creating new runner", "runner_name", newRunnerName)
 		decodedJit, err := jitConfig.DecodedJITConfig()
 		if err != nil {
 			slog.ErrorContext(w.ctx, "error decoding jit config", "error", err)
-			continue
+			return params.Instance{}, false
 		}
 		runnerParams := params.CreateInstanceParams{
 			Name:              newRunnerName,
@@ -912,10 +916,43 @@ func (w *Worker) handleScaleUp() {
 			if err := scaleSetCli.RemoveRunner(w.ctx, jitConfig.Runner.ID); err != nil {
 				slog.ErrorContext(w.ctx, "error deleting runner", "error", err)
 			}
-			continue
+			return params.Instance{}, false
 		}
+		return dbInstance, true
+	})
+	for _, dbInstance := range createdRunners {
 		w.runners[dbInstance.ID] = dbInstance
 	}
+}
+
+func runRunnerCreationsConcurrently(count int, create func() (params.Instance, bool)) []params.Instance {
+	created := make(chan params.Instance, count)
+	jobs := make(chan struct{}, count)
+	for range count {
+		jobs <- struct{}{}
+	}
+	close(jobs)
+
+	var group sync.WaitGroup
+	for range min(count, maxConcurrentRunnerCreations) {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for range jobs {
+				if instance, ok := create(); ok {
+					created <- instance
+				}
+			}
+		}()
+	}
+	group.Wait()
+	close(created)
+
+	instances := make([]params.Instance, 0, count)
+	for instance := range created {
+		instances = append(instances, instance)
+	}
+	return instances
 }
 
 func (w *Worker) waitForToolsOrCancel() (hasTools, stopped bool) {
