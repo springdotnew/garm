@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	maxConcurrentRunnerCreations = 8
+	maxConcurrentRunnerCreations = 32
 	scaleDownIdleGrace           = 30 * time.Second
 )
 

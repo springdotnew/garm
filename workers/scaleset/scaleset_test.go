@@ -155,11 +155,11 @@ func TestRunnerCreationsToStart(t *testing.T) {
 		inFlight      int
 		wantCreations int
 	}{
-		{name: "full burst", target: 8, wantCreations: 8},
-		{name: "demand grows during first wave", target: 8, inFlight: 6, wantCreations: 2},
-		{name: "existing and in flight satisfy target", target: 8, current: 5, inFlight: 3},
-		{name: "concurrency cap", target: 20, wantCreations: 8},
-		{name: "one slot remains", target: 20, current: 11, inFlight: 7, wantCreations: 1},
+		{name: "full burst", target: 32, wantCreations: 32},
+		{name: "demand grows during first wave", target: 32, inFlight: 24, wantCreations: 8},
+		{name: "existing and in flight satisfy target", target: 32, current: 20, inFlight: 12},
+		{name: "concurrency cap", target: 40, wantCreations: 32},
+		{name: "one slot remains", target: 40, current: 8, inFlight: 31, wantCreations: 1},
 		{name: "target decreased", target: 4, current: 4, inFlight: 2},
 	}
 
@@ -173,7 +173,7 @@ func TestRunnerCreationsToStart(t *testing.T) {
 }
 
 func TestStartRunnerCreationsDoesNotWaitForFirstWave(t *testing.T) {
-	const runnerCount = 8
+	const runnerCount = 32
 	started := make(chan struct{}, runnerCount)
 	release := make(chan struct{})
 
