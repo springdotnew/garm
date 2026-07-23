@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -272,6 +273,205 @@ func (s *PoolStressTestSuite) TestConcurrentQueuedJobs() {
 	queuedJobs, err := s.store.ListJobsByStatus(s.adminCtx, params.JobStatusQueued)
 	s.Require().NoError(err)
 	s.Len(queuedJobs, numJobs, "expected %d queued jobs in DB", numJobs)
+}
+
+func (s *PoolStressTestSuite) TestConsumeQueuedJobsReservesRunnersConcurrently() {
+	const (
+		numJobs             = 8
+		requiredConcurrency = 4
+	)
+
+	s.providerMock.On("DisableJITConfig").Return(false)
+
+	started := make(chan struct{}, numJobs)
+	release := make(chan struct{})
+	var active int32
+	var maximum int32
+	s.ghcliMock.On(
+		"GetEntityJITConfig",
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+	).Run(func(mock.Arguments) {
+		current := atomic.AddInt32(&active, 1)
+		for {
+			observed := atomic.LoadInt32(&maximum)
+			if current <= observed || atomic.CompareAndSwapInt32(&maximum, observed, current) {
+				break
+			}
+		}
+		started <- struct{}{}
+		<-release
+		atomic.AddInt32(&active, -1)
+	}).Return(map[string]string{"encoded_jit_config": "test"}, nil, nil)
+
+	labels := []string{"self-hosted", "linux", "x64"}
+	for i := range numJobs {
+		job := s.makeWorkflowJob(int64(2500+i), "queued", "queued", "", labels)
+		s.Require().NoError(s.mgr.HandleWorkflowJob(job))
+	}
+	s.syncJobsFromDB()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.mgr.consumeQueuedJobs()
+	}()
+
+	reachedTarget := true
+	for range requiredConcurrency {
+		select {
+		case <-started:
+		case <-time.After(250 * time.Millisecond):
+			reachedTarget = false
+		}
+		if !reachedTarget {
+			break
+		}
+	}
+
+	close(release)
+	s.Require().NoError(<-done)
+	s.True(
+		reachedTarget,
+		"expected at least %d concurrent JIT reservations, observed %d",
+		requiredConcurrency,
+		atomic.LoadInt32(&maximum),
+	)
+}
+
+func (s *PoolStressTestSuite) TestConsumeQueuedJobsRetriesAfterLateReservationFailure() {
+	const numJobs = queuedJobReservationConcurrency + 1
+
+	maxRunners := uint(queuedJobReservationConcurrency)
+	pool, err := s.store.UpdateEntityPool(s.adminCtx, s.entity, s.pool.ID, params.UpdatePoolParams{
+		MaxRunners: &maxRunners,
+	})
+	s.Require().NoError(err)
+	s.pool = pool
+	cache.SetEntityPool(s.entity.ID, pool)
+
+	s.providerMock.On("DisableJITConfig").Return(false)
+
+	started := make(chan struct{}, queuedJobReservationConcurrency)
+	releaseFirstSuccess := make(chan struct{})
+	releaseOtherSuccesses := make(chan struct{})
+	releaseLateFailure := make(chan struct{})
+	retriedReservation := make(chan struct{}, 1)
+
+	var closeFirstSuccess sync.Once
+	var closeOtherSuccesses sync.Once
+	var closeLateFailure sync.Once
+	defer closeFirstSuccess.Do(func() { close(releaseFirstSuccess) })
+	defer closeOtherSuccesses.Do(func() { close(releaseOtherSuccesses) })
+	defer closeLateFailure.Do(func() { close(releaseLateFailure) })
+
+	jitConfigCall := func() *mock.Call {
+		return s.ghcliMock.On(
+			"GetEntityJITConfig",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		)
+	}
+	jitConfigCall().Run(func(mock.Arguments) {
+		started <- struct{}{}
+		<-releaseFirstSuccess
+	}).Return(map[string]string{"encoded_jit_config": "test"}, nil, nil).Once()
+	jitConfigCall().Run(func(mock.Arguments) {
+		started <- struct{}{}
+		<-releaseOtherSuccesses
+	}).Return(map[string]string{"encoded_jit_config": "test"}, nil, nil).Times(
+		queuedJobReservationConcurrency - 2,
+	)
+	jitConfigCall().Run(func(mock.Arguments) {
+		started <- struct{}{}
+		<-releaseLateFailure
+	}).Return(nil, nil, fmt.Errorf("late JIT reservation failure")).Once()
+	jitConfigCall().Run(func(mock.Arguments) {
+		retriedReservation <- struct{}{}
+	}).Return(map[string]string{"encoded_jit_config": "test"}, nil, nil).Once()
+
+	labels := []string{"self-hosted", "linux", "x64"}
+	for i := range numJobs {
+		job := s.makeWorkflowJob(int64(2600+i), "queued", "queued", "", labels)
+		s.Require().NoError(s.mgr.HandleWorkflowJob(job))
+	}
+	s.syncJobsFromDB()
+
+	limiter := newPoolReservationLimiter()
+	done := make(chan error, 1)
+	go func() {
+		done <- s.mgr.consumeQueuedJobsWithLimiter(limiter)
+	}()
+
+	for range queuedJobReservationConcurrency {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			s.FailNow("initial reservations did not all start")
+		}
+	}
+
+	closeFirstSuccess.Do(func() { close(releaseFirstSuccess) })
+	s.Require().Eventually(func() bool {
+		limiter.mux.Lock()
+		defer limiter.mux.Unlock()
+		return limiter.waiters > 0
+	}, time.Second, time.Millisecond, "extra job did not wait on transient saturation")
+
+	closeLateFailure.Do(func() { close(releaseLateFailure) })
+	select {
+	case <-retriedReservation:
+	case <-time.After(time.Second):
+		s.FailNow("queued job was not retried when the late reservation failure released capacity")
+	}
+
+	closeOtherSuccesses.Do(func() { close(releaseOtherSuccesses) })
+	s.Require().NoError(<-done)
+
+	instances, err := s.store.ListPoolInstances(s.adminCtx, s.pool.ID, false)
+	s.Require().NoError(err)
+	s.Len(instances, queuedJobReservationConcurrency,
+		"the released reservation should be filled without another consumer tick")
+}
+
+func TestLoopTriggerRunsFunctionBeforeInterval(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	manager := &basePoolManager{
+		ctx:              ctx,
+		quit:             make(chan struct{}),
+		wg:               &sync.WaitGroup{},
+		managerIsRunning: true,
+	}
+	trigger := make(chan struct{}, 1)
+	called := make(chan struct{}, 1)
+
+	go manager.startLoopForFunction(
+		func() error {
+			called <- struct{}{}
+			return nil
+		},
+		time.Hour,
+		"trigger_test",
+		false,
+		trigger,
+	)
+
+	trigger <- struct{}{}
+	select {
+	case <-called:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("expected trigger to run function before polling interval")
+	}
+
+	cancel()
+	if err := manager.Wait(); err != nil {
+		t.Fatalf("wait for triggered loop: %v", err)
+	}
 }
 
 // TestJobStuckInQueuedWithMinIdleEqMaxRunners tests the key scenario where

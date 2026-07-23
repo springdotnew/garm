@@ -69,7 +69,64 @@ const (
 	// nolint:golangci-lint,godox
 	// TODO: make this configurable(?)
 	maxCreateAttempts = 5
+
+	queuedJobReservationConcurrency = 8
 )
+
+type poolReservationLimiter struct {
+	mux       sync.Mutex
+	baseCount map[string]int64
+	reserved  map[string]int64
+	inFlight  map[string]int64
+	changed   chan struct{}
+	waiters   int
+}
+
+func newPoolReservationLimiter() *poolReservationLimiter {
+	return &poolReservationLimiter{
+		baseCount: make(map[string]int64),
+		reserved:  make(map[string]int64),
+		inFlight:  make(map[string]int64),
+		changed:   make(chan struct{}),
+	}
+}
+
+func (p *poolReservationLimiter) reservationFinished(poolID string, succeeded bool) {
+	p.mux.Lock()
+	defer p.mux.Unlock()
+
+	p.inFlight[poolID]--
+	if !succeeded {
+		p.reserved[poolID]--
+	}
+	close(p.changed)
+	p.changed = make(chan struct{})
+}
+
+func (p *poolReservationLimiter) waitForReservation(
+	ctx context.Context,
+	quit <-chan struct{},
+	changed <-chan struct{},
+) bool {
+	p.mux.Lock()
+	p.waiters++
+	p.mux.Unlock()
+
+	defer func() {
+		p.mux.Lock()
+		p.waiters--
+		p.mux.Unlock()
+	}()
+
+	select {
+	case <-changed:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-quit:
+		return false
+	}
+}
 
 func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instanceTokenGetter auth.InstanceTokenGetter, providers map[string]common.Provider, store dbCommon.Store) (common.PoolManager, error) {
 	ctx = garmUtil.WithSlogContext(
@@ -124,14 +181,15 @@ func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instan
 		controllerInfo:      controllerInfo,
 		instanceTokenGetter: instanceTokenGetter,
 
-		store:       store,
-		providers:   providers,
-		quit:        make(chan struct{}),
-		jobs:        make(map[int64]params.Job),
-		checkedJobs: make(map[int64]time.Time),
-		wg:          wg,
-		backoff:     backoff,
-		consumer:    consumer,
+		store:                   store,
+		providers:               providers,
+		quit:                    make(chan struct{}),
+		jobs:                    make(map[int64]params.Job),
+		checkedJobs:             make(map[int64]time.Time),
+		wg:                      wg,
+		backoff:                 backoff,
+		consumer:                consumer,
+		pendingInstancesTrigger: make(chan struct{}, 1),
 	}
 	return repo, nil
 }
@@ -153,6 +211,8 @@ type basePoolManager struct {
 	tools       []commonParams.RunnerApplicationDownload
 	quit        chan struct{}
 	checkedJobs map[int64]time.Time
+
+	pendingInstancesTrigger chan struct{}
 
 	managerIsRunning   bool
 	managerErrorReason string
@@ -504,7 +564,13 @@ func jobIDFromLabels(labels []string) int64 {
 	return 0
 }
 
-func (r *basePoolManager) startLoopForFunction(f func() error, interval time.Duration, name string, alwaysRun bool) {
+func (r *basePoolManager) startLoopForFunction(
+	f func() error,
+	interval time.Duration,
+	name string,
+	alwaysRun bool,
+	trigger <-chan struct{},
+) {
 	slog.InfoContext(
 		r.ctx, "starting loop for entity",
 		"loop_name", name)
@@ -528,20 +594,21 @@ func (r *basePoolManager) startLoopForFunction(f func() error, interval time.Dur
 		case true:
 			select {
 			case <-ticker.C:
-				if err := f(); err != nil {
-					slog.With(slog.Any("error", err)).ErrorContext(
-						r.ctx, "error in loop",
-						"loop_name", name)
-					if errors.Is(err, runnerErrors.ErrUnauthorized) {
-						r.SetPoolRunningState(false, err.Error())
-					}
-				}
+			case <-trigger:
 			case <-r.ctx.Done():
 				// daemon is shutting down.
 				return
 			case <-r.quit:
 				// this worker was stopped.
 				return
+			}
+			if err := f(); err != nil {
+				slog.With(slog.Any("error", err)).ErrorContext(
+					r.ctx, "error in loop",
+					"loop_name", name)
+				if errors.Is(err, runnerErrors.ErrUnauthorized) {
+					r.SetPoolRunningState(false, err.Error())
+				}
 			}
 		default:
 			select {
@@ -1349,24 +1416,53 @@ func (r *basePoolManager) scaleDownOnePool(ctx context.Context, pool params.Pool
 	return nil
 }
 
-func (r *basePoolManager) addRunnerToPool(pool params.Pool, aditionalLabels []string) error {
+func (r *basePoolManager) addRunnerToPoolConcurrently(
+	pool params.Pool,
+	aditionalLabels []string,
+	limiter *poolReservationLimiter,
+) (<-chan struct{}, error) {
 	if !pool.Enabled {
-		return fmt.Errorf("pool %s is disabled", pool.ID)
+		return nil, fmt.Errorf("pool %s is disabled", pool.ID)
 	}
 
-	poolInstanceCount, err := r.store.PoolInstanceCount(r.ctx, pool.ID)
-	if err != nil {
-		return fmt.Errorf("failed to list pool instances: %w", err)
+	limiter.mux.Lock()
+	poolInstanceCount, ok := limiter.baseCount[pool.ID]
+	if !ok {
+		var err error
+		poolInstanceCount, err = r.store.PoolInstanceCount(r.ctx, pool.ID)
+		if err != nil {
+			limiter.mux.Unlock()
+			return nil, fmt.Errorf("failed to list pool instances: %w", err)
+		}
+		limiter.baseCount[pool.ID] = poolInstanceCount
 	}
 
-	if poolInstanceCount >= int64(pool.MaxRunners) {
-		return runnerErrors.NewNoCapacityError("max workers (%d) reached for pool %s", pool.MaxRunners, pool.ID)
+	if poolInstanceCount+limiter.reserved[pool.ID] >= int64(pool.MaxRunners) {
+		var changed <-chan struct{}
+		if limiter.inFlight[pool.ID] > 0 {
+			changed = limiter.changed
+		}
+		limiter.mux.Unlock()
+		return changed, runnerErrors.NewNoCapacityError(
+			"max workers (%d) reached for pool %s",
+			pool.MaxRunners,
+			pool.ID,
+		)
 	}
+	limiter.reserved[pool.ID]++
+	limiter.inFlight[pool.ID]++
+	limiter.mux.Unlock()
+
+	reservationSucceeded := false
+	defer func() {
+		limiter.reservationFinished(pool.ID, reservationSucceeded)
+	}()
 
 	if err := r.AddRunner(r.ctx, pool.ID, aditionalLabels); err != nil {
-		return fmt.Errorf("failed to add new instance for pool %s: %w", pool.ID, err)
+		return nil, fmt.Errorf("failed to add new instance for pool %s: %w", pool.ID, err)
 	}
-	return nil
+	reservationSucceeded = true
+	return nil, nil
 }
 
 func (r *basePoolManager) ensureIdleRunnersForOnePool(pool params.Pool) error {
@@ -1911,16 +2007,16 @@ func (r *basePoolManager) Start() error {
 		case <-initializeEntity:
 		}
 		defer close(initializeEntity)
-		go r.startLoopForFunction(r.runnerCleanup, common.PoolReapTimeoutInterval, "timeout_reaper", false)
-		go r.startLoopForFunction(r.scaleDown, common.PoolScaleDownInterval, "scale_down", false)
+		go r.startLoopForFunction(r.runnerCleanup, common.PoolReapTimeoutInterval, "timeout_reaper", false, nil)
+		go r.startLoopForFunction(r.scaleDown, common.PoolScaleDownInterval, "scale_down", false, nil)
 		// always run the delete pending instances routine. This way we can still remove existing runners, even if the pool is not running.
-		go r.startLoopForFunction(r.deletePendingInstances, common.PoolConsilitationInterval, "consolidate[delete_pending]", true)
-		go r.startLoopForFunction(r.addPendingInstances, common.PoolConsilitationInterval, "consolidate[add_pending]", false)
-		go r.startLoopForFunction(r.ensureMinIdleRunners, common.PoolConsilitationInterval, "consolidate[ensure_min_idle]", false)
-		go r.startLoopForFunction(r.retryFailedInstances, common.PoolConsilitationInterval, "consolidate[retry_failed]", false)
-		go r.startLoopForFunction(r.updateTools, common.PoolToolUpdateInterval, "update_tools", true)
-		go r.startLoopForFunction(r.consumeQueuedJobs, common.PoolConsilitationInterval, "job_queue_consumer", false)
-		go r.startLoopForFunction(r.reconcileStaleJobs, common.PoolStaleJobReconcileInterval, "stale_job_reconciler", false)
+		go r.startLoopForFunction(r.deletePendingInstances, common.PoolConsilitationInterval, "consolidate[delete_pending]", true, nil)
+		go r.startLoopForFunction(r.addPendingInstances, common.PoolConsilitationInterval, "consolidate[add_pending]", false, r.pendingInstancesTrigger)
+		go r.startLoopForFunction(r.ensureMinIdleRunners, common.PoolConsilitationInterval, "consolidate[ensure_min_idle]", false, nil)
+		go r.startLoopForFunction(r.retryFailedInstances, common.PoolConsilitationInterval, "consolidate[retry_failed]", false, nil)
+		go r.startLoopForFunction(r.updateTools, common.PoolToolUpdateInterval, "update_tools", true, nil)
+		go r.startLoopForFunction(r.consumeQueuedJobs, common.PoolConsilitationInterval, "job_queue_consumer", false, nil)
+		go r.startLoopForFunction(r.reconcileStaleJobs, common.PoolStaleJobReconcileInterval, "stale_job_reconciler", false, nil)
 	}()
 	return nil
 }
@@ -2098,6 +2194,10 @@ func (r *basePoolManager) reconcileStaleJobs() error {
 // so those will trigger the creation of a runner. The jobs we don't know about will be dealt with by the idle runners.
 // Once jobs are consumed, you can set min-idle-runners to 0 again.
 func (r *basePoolManager) consumeQueuedJobs() error {
+	return r.consumeQueuedJobsWithLimiter(newPoolReservationLimiter())
+}
+
+func (r *basePoolManager) consumeQueuedJobsWithLimiter(reservationLimiter *poolReservationLimiter) error {
 	defer func() {
 		// Always try to clean inactionable jobs. Otherwise, if any condition
 		// makes this function exit, we never clean up jobs.
@@ -2112,6 +2212,8 @@ func (r *basePoolManager) consumeQueuedJobs() error {
 	poolsCache := poolsForTags{
 		poolCacheType: r.entity.GetPoolBalancerType(),
 	}
+	reservations := &errgroup.Group{}
+	reservations.SetLimit(queuedJobReservationConcurrency)
 
 	slog.DebugContext(
 		r.ctx, "found queued jobs",
@@ -2176,7 +2278,6 @@ func (r *basePoolManager) consumeQueuedJobs() error {
 			continue
 		}
 
-		runnerCreated := false
 		if err := r.store.LockJob(r.ctx, job.WorkflowJobID, r.ID()); err != nil {
 			slog.With(slog.Any("error", err)).ErrorContext(
 				r.ctx, "could not lock job",
@@ -2184,43 +2285,69 @@ func (r *basePoolManager) consumeQueuedJobs() error {
 			continue
 		}
 
-		jobLabels := []string{
-			fmt.Sprintf("%s=%d", jobLabelPrefix, job.WorkflowJobID),
-		}
-		for i := 0; i < poolRR.Len(); i++ {
-			pool, err := poolRR.Next()
-			if err != nil {
-				slog.With(slog.Any("error", err)).ErrorContext(
-					r.ctx, "could not find a pool to create a runner for job",
-					"job_id", job.WorkflowJobID)
-				break
-			}
-
-			slog.InfoContext(
-				r.ctx, "attempting to create a runner in pool",
-				"pool_id", pool.ID,
+		candidates, err := poolRR.Candidates()
+		if err != nil {
+			slog.With(slog.Any("error", err)).ErrorContext(
+				r.ctx, "could not find a pool to create a runner for job",
 				"job_id", job.WorkflowJobID)
-			if err := r.addRunnerToPool(pool, jobLabels); err != nil {
-				if errors.Is(err, runnerErrors.ErrNoCapacity) {
-					slog.With(slog.Any("error", err)).InfoContext(
-						r.ctx, "could not add runner to pool",
-						"pool_id", pool.ID)
-				} else {
-					slog.With(slog.Any("error", err)).ErrorContext(
-						r.ctx, "could not add runner to pool",
-						"pool_id", pool.ID)
+			if err := r.store.UnlockJob(r.ctx, job.WorkflowJobID, r.ID()); err != nil {
+				return fmt.Errorf("error unlocking job: %w", err)
+			}
+			continue
+		}
+
+		job := job
+		reservations.Go(func() error {
+			jobLabels := []string{
+				fmt.Sprintf("%s=%d", jobLabelPrefix, job.WorkflowJobID),
+			}
+			for {
+				var reservationChanged <-chan struct{}
+				for _, pool := range candidates {
+					slog.InfoContext(
+						r.ctx, "attempting to create a runner in pool",
+						"pool_id", pool.ID,
+						"job_id", job.WorkflowJobID)
+					startedAt := time.Now()
+					changed, err := r.addRunnerToPoolConcurrently(pool, jobLabels, reservationLimiter)
+					if err != nil {
+						log := slog.With(
+							slog.Any("error", err),
+							slog.String("pool_id", pool.ID),
+							slog.Int64("job_id", job.WorkflowJobID),
+							slog.Duration("reservation_duration", time.Since(startedAt)),
+						)
+						if errors.Is(err, runnerErrors.ErrNoCapacity) {
+							log.InfoContext(r.ctx, "could not add runner to pool")
+						} else {
+							log.ErrorContext(r.ctx, "could not add runner to pool")
+						}
+						if reservationChanged == nil && changed != nil {
+							reservationChanged = changed
+						}
+						continue
+					}
+					slog.InfoContext(
+						r.ctx, "runner reservation completed",
+						"pool_id", pool.ID,
+						"job_id", job.WorkflowJobID,
+						"reservation_duration", time.Since(startedAt))
+					select {
+					case r.pendingInstancesTrigger <- struct{}{}:
+					default:
+					}
+					return nil
 				}
-				continue
+				if reservationChanged == nil ||
+					!reservationLimiter.waitForReservation(r.ctx, r.quit, reservationChanged) {
+					break
+				}
+				slog.DebugContext(
+					r.ctx, "retrying queued job after an in-flight reservation completed",
+					"job_id", job.WorkflowJobID)
 			}
-			slog.DebugContext(r.ctx, "a new runner was added as a response to queued job",
-				"pool_id", pool.ID,
-				"job_id", job.WorkflowJobID)
-			runnerCreated = true
-			break
-		}
 
-		if !runnerCreated {
-			slog.InfoContext(
+			slog.WarnContext(
 				r.ctx, "could not create a runner for job; unlocking",
 				"job_id", job.WorkflowJobID)
 			if err := r.store.UnlockJob(r.ctx, job.WorkflowJobID, r.ID()); err != nil {
@@ -2229,9 +2356,10 @@ func (r *basePoolManager) consumeQueuedJobs() error {
 					"job_id", job.WorkflowJobID)
 				return fmt.Errorf("error unlocking job: %w", err)
 			}
-		}
+			return nil
+		})
 	}
-	return nil
+	return reservations.Wait()
 }
 
 func (r *basePoolManager) UninstallWebhook(ctx context.Context) error {

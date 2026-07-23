@@ -22,52 +22,34 @@ import (
 	"github.com/cloudbase/garm/params"
 )
 
-func TestPoolRoundRobinRollsOver(t *testing.T) {
+func TestPoolRoundRobinCandidatesPreserveFallbackOrder(t *testing.T) {
 	p := &poolRoundRobin{
 		pools: []params.Pool{
-			{
-				ID: "1",
-			},
-			{
-				ID: "2",
-			},
+			{ID: "1"},
+			{ID: "2"},
+			{ID: "3"},
 		},
 	}
 
-	pool, err := p.Next()
+	first, err := p.Candidates()
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}
-	if pool.ID != "1" {
-		t.Fatalf("expected pool 1, got %s", pool.ID)
-	}
+	assertPoolIDs(t, first, []string{"1", "2", "3"})
 
-	pool, err = p.Next()
+	second, err := p.Candidates()
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}
-	if pool.ID != "2" {
-		t.Fatalf("expected pool 2, got %s", pool.ID)
-	}
-
-	pool, err = p.Next()
-	if err != nil {
-		t.Fatalf("unexpected error: %s", err)
-	}
-	if pool.ID != "1" {
-		t.Fatalf("expected pool 1, got %s", pool.ID)
-	}
+	assertPoolIDs(t, second, []string{"2", "3", "1"})
 }
 
 func TestPoolRoundRobinEmptyPoolErrorsOut(t *testing.T) {
 	p := &poolRoundRobin{}
 
-	_, err := p.Next()
-	if err == nil {
-		t.Fatalf("expected error, got nil")
-	}
+	_, err := p.Candidates()
 	if err != runnerErrors.ErrNoPoolsAvailable {
-		t.Fatalf("expected ErrNoPoolsAvailable, got %s", err)
+		t.Fatalf("expected ErrNoPoolsAvailable from Candidates, got %s", err)
 	}
 }
 
@@ -100,7 +82,9 @@ func TestPoolRoundRobinReset(t *testing.T) {
 		},
 	}
 
-	p.Next()
+	if _, err := p.Candidates(); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
 	p.Reset()
 	if p.next != 0 {
 		t.Fatalf("expected 0, got %d", p.next)
@@ -138,13 +122,11 @@ func TestPoolsForTagsPackGet(t *testing.T) {
 	if poolRR.next != 0 {
 		t.Fatalf("expected 0, got %d", poolRR.next)
 	}
-	pool, err := poolRR.Next()
+	candidates, err := poolRR.Candidates()
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}
-	if pool.ID != "2" {
-		t.Fatalf("expected pool 2, got %s", pool.ID)
-	}
+	assertPoolIDs(t, candidates, []string{"2", "1"})
 
 	if poolRR.next != 1 {
 		t.Fatalf("expected 1, got %d", poolRR.next)
@@ -161,6 +143,12 @@ func TestPoolsForTagsPackGet(t *testing.T) {
 	if poolRR.next != 0 {
 		t.Fatalf("expected 0, got %d", poolRR.next)
 	}
+
+	candidates, err = poolRR.Candidates()
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	assertPoolIDs(t, candidates, []string{"2", "1"})
 }
 
 func TestPoolsForTagsRoundRobinGet(t *testing.T) {
@@ -187,26 +175,22 @@ func TestPoolsForTagsRoundRobinGet(t *testing.T) {
 		t.Fatalf("expected 2, got %d", cache.Len())
 	}
 
-	pool, err := cache.Next()
+	candidates, err := cache.Candidates()
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}
-	if pool.ID != "2" {
-		t.Fatalf("expected pool 2, got %s", pool.ID)
-	}
+	assertPoolIDs(t, candidates, []string{"2", "1"})
 	// Getting the pool cache again should not reset next, and
 	// should return the next pool.
 	cache, ok = p.Get([]string{"key"})
 	if !ok {
 		t.Fatalf("expected true, got false")
 	}
-	pool, err = cache.Next()
+	candidates, err = cache.Candidates()
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}
-	if pool.ID != "1" {
-		t.Fatalf("expected pool 1, got %s", pool.ID)
-	}
+	assertPoolIDs(t, candidates, []string{"1", "2"})
 }
 
 func TestPoolsForTagsNoPoolsForTag(t *testing.T) {
@@ -238,5 +222,17 @@ func TestPoolsForTagsBalancerTypePack(t *testing.T) {
 	}
 	if poolCache.next != 0 {
 		t.Fatalf("expected 0, got %d", poolCache.next)
+	}
+}
+
+func assertPoolIDs(t *testing.T, actual []params.Pool, expected []string) {
+	t.Helper()
+	if len(actual) != len(expected) {
+		t.Fatalf("expected %d pools, got %d", len(expected), len(actual))
+	}
+	for index, expectedID := range expected {
+		if actual[index].ID != expectedID {
+			t.Fatalf("pool %d: expected %s, got %s", index, expectedID, actual[index].ID)
+		}
 	}
 }
