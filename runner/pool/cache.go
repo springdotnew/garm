@@ -12,7 +12,6 @@ import (
 
 type poolCacheStore interface {
 	Candidates() ([]params.Pool, error)
-	MaintainsIdleRunners() bool
 	Next() (params.Pool, error)
 	Reset()
 	Len() int
@@ -48,15 +47,6 @@ func (p *poolRoundRobin) Candidates() ([]params.Pool, error) {
 
 func (p *poolRoundRobin) Len() int {
 	return len(p.pools)
-}
-
-func (p *poolRoundRobin) MaintainsIdleRunners() bool {
-	for _, pool := range p.pools {
-		if pool.MinIdleRunners > 0 {
-			return true
-		}
-	}
-	return false
 }
 
 func (p *poolRoundRobin) Reset() {

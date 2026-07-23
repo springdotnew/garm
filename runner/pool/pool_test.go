@@ -556,14 +556,6 @@ func (s *PoolStressTestSuite) TestConsumeQueuedJobsRespectsBackoff() {
 
 	labels := []string{"self-hosted", "linux", "x64"}
 
-	minIdleRunners := uint(1)
-	pool, err := s.store.UpdateEntityPool(s.adminCtx, s.entity, s.pool.ID, params.UpdatePoolParams{
-		MinIdleRunners: &minIdleRunners,
-	})
-	s.Require().NoError(err)
-	s.pool = pool
-	cache.SetEntityPool(s.entity.ID, pool)
-
 	// Set a 5-second backoff
 	s.mgr.controllerInfo.MinimumJobAgeBackoff = 5
 
@@ -577,7 +569,7 @@ func (s *PoolStressTestSuite) TestConsumeQueuedJobsRespectsBackoff() {
 		RepositoryOwner: "test-owner",
 		RepoID:          garmTesting.Ptr(mustParseUUID(s.entity.ID)),
 	}
-	_, err = s.store.CreateOrUpdateJob(s.adminCtx, job)
+	_, err := s.store.CreateOrUpdateJob(s.adminCtx, job)
 	s.Require().NoError(err)
 	s.syncJobsFromDB()
 
@@ -611,35 +603,6 @@ func (s *PoolStressTestSuite) TestConsumeQueuedJobsRespectsBackoff() {
 	s.Require().NoError(err)
 	s.Len(queuedJobs, 1, "job should still be queued")
 	s.NotEqual(uuid.UUID{}, queuedJobs[0].LockedBy, "job should be locked after consume")
-}
-
-func (s *PoolStressTestSuite) TestConsumeQueuedJobsBypassesBackoffForScaleToZeroPool() {
-	s.setupProviderMocks()
-	s.mgr.controllerInfo.MinimumJobAgeBackoff = 5
-
-	job := params.Job{
-		WorkflowJobID:   5002,
-		Action:          "queued",
-		Status:          "queued",
-		Labels:          []string{"self-hosted", "linux", "x64"},
-		RepositoryName:  "test-repo",
-		RepositoryOwner: "test-owner",
-		RepoID:          garmTesting.Ptr(mustParseUUID(s.entity.ID)),
-	}
-	_, err := s.store.CreateOrUpdateJob(s.adminCtx, job)
-	s.Require().NoError(err)
-	s.syncJobsFromDB()
-
-	s.Require().NoError(s.mgr.consumeQueuedJobs())
-
-	instances, err := s.store.ListPoolInstances(s.adminCtx, s.pool.ID, false)
-	s.Require().NoError(err)
-	s.NotEmpty(instances, "scale-to-zero pool should reserve without waiting for idle runners")
-
-	queuedJobs, err := s.store.ListJobsByStatus(s.adminCtx, params.JobStatusQueued)
-	s.Require().NoError(err)
-	s.Require().Len(queuedJobs, 1)
-	s.NotEqual(uuid.UUID{}, queuedJobs[0].LockedBy, "job should be locked after reservation")
 }
 
 // TestConcurrentWebhooksForSameJob sends the same job ID as queued from multiple
