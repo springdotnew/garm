@@ -68,7 +68,22 @@ const (
 	// nolint:golangci-lint,godox
 	// TODO: make this configurable(?)
 	maxCreateAttempts = 5
+
+	queuedJobReservationConcurrency = 8
 )
+
+type poolReservationLimiter struct {
+	mux       sync.Mutex
+	baseCount map[string]int64
+	reserved  map[string]int64
+}
+
+func newPoolReservationLimiter() *poolReservationLimiter {
+	return &poolReservationLimiter{
+		baseCount: make(map[string]int64),
+		reserved:  make(map[string]int64),
+	}
+}
 
 func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instanceTokenGetter auth.InstanceTokenGetter, providers map[string]common.Provider, store dbCommon.Store) (common.PoolManager, error) {
 	ctx = garmUtil.WithSlogContext(
@@ -1343,6 +1358,51 @@ func (r *basePoolManager) addRunnerToPool(pool params.Pool, aditionalLabels []st
 	return nil
 }
 
+func (r *basePoolManager) addRunnerToPoolConcurrently(
+	pool params.Pool,
+	aditionalLabels []string,
+	limiter *poolReservationLimiter,
+) error {
+	if !pool.Enabled {
+		return fmt.Errorf("pool %s is disabled", pool.ID)
+	}
+
+	limiter.mux.Lock()
+	poolInstanceCount, ok := limiter.baseCount[pool.ID]
+	if !ok {
+		var err error
+		poolInstanceCount, err = r.store.PoolInstanceCount(r.ctx, pool.ID)
+		if err != nil {
+			limiter.mux.Unlock()
+			return fmt.Errorf("failed to list pool instances: %w", err)
+		}
+		limiter.baseCount[pool.ID] = poolInstanceCount
+	}
+
+	if poolInstanceCount+limiter.reserved[pool.ID] >= int64(pool.MaxRunners) {
+		limiter.mux.Unlock()
+		return fmt.Errorf("max workers (%d) reached for pool %s", pool.MaxRunners, pool.ID)
+	}
+	limiter.reserved[pool.ID]++
+	limiter.mux.Unlock()
+
+	reservationSucceeded := false
+	defer func() {
+		if reservationSucceeded {
+			return
+		}
+		limiter.mux.Lock()
+		limiter.reserved[pool.ID]--
+		limiter.mux.Unlock()
+	}()
+
+	if err := r.AddRunner(r.ctx, pool.ID, aditionalLabels); err != nil {
+		return fmt.Errorf("failed to add new instance for pool %s: %w", pool.ID, err)
+	}
+	reservationSucceeded = true
+	return nil
+}
+
 func (r *basePoolManager) ensureIdleRunnersForOnePool(pool params.Pool) error {
 	if !pool.Enabled || pool.MinIdleRunners == 0 {
 		return nil
@@ -2085,6 +2145,9 @@ func (r *basePoolManager) consumeQueuedJobs() error {
 	poolsCache := poolsForTags{
 		poolCacheType: r.entity.GetPoolBalancerType(),
 	}
+	reservationLimiter := newPoolReservationLimiter()
+	reservations := &errgroup.Group{}
+	reservations.SetLimit(queuedJobReservationConcurrency)
 
 	slog.DebugContext(
 		r.ctx, "found queued jobs",
@@ -2149,7 +2212,6 @@ func (r *basePoolManager) consumeQueuedJobs() error {
 			continue
 		}
 
-		runnerCreated := false
 		if err := r.store.LockJob(r.ctx, job.WorkflowJobID, r.ID()); err != nil {
 			slog.With(slog.Any("error", err)).ErrorContext(
 				r.ctx, "could not lock job",
@@ -2157,36 +2219,44 @@ func (r *basePoolManager) consumeQueuedJobs() error {
 			continue
 		}
 
-		jobLabels := []string{
-			fmt.Sprintf("%s=%d", jobLabelPrefix, job.WorkflowJobID),
+		candidates, err := poolRR.Candidates()
+		if err != nil {
+			slog.With(slog.Any("error", err)).ErrorContext(
+				r.ctx, "could not find a pool to create a runner for job",
+				"job_id", job.WorkflowJobID)
+			if err := r.store.UnlockJob(r.ctx, job.WorkflowJobID, r.ID()); err != nil {
+				return fmt.Errorf("error unlocking job: %w", err)
+			}
+			continue
 		}
-		for i := 0; i < poolRR.Len(); i++ {
-			pool, err := poolRR.Next()
-			if err != nil {
-				slog.With(slog.Any("error", err)).ErrorContext(
-					r.ctx, "could not find a pool to create a runner for job",
+
+		job := job
+		reservations.Go(func() error {
+			jobLabels := []string{
+				fmt.Sprintf("%s=%d", jobLabelPrefix, job.WorkflowJobID),
+			}
+			for _, pool := range candidates {
+				slog.InfoContext(
+					r.ctx, "attempting to create a runner in pool",
+					"pool_id", pool.ID,
 					"job_id", job.WorkflowJobID)
-				break
+				startedAt := time.Now()
+				if err := r.addRunnerToPoolConcurrently(pool, jobLabels, reservationLimiter); err != nil {
+					slog.With(slog.Any("error", err)).ErrorContext(
+						r.ctx, "could not add runner to pool",
+						"pool_id", pool.ID,
+						"job_id", job.WorkflowJobID,
+						"reservation_duration", time.Since(startedAt))
+					continue
+				}
+				slog.InfoContext(
+					r.ctx, "runner reservation completed",
+					"pool_id", pool.ID,
+					"job_id", job.WorkflowJobID,
+					"reservation_duration", time.Since(startedAt))
+				return nil
 			}
 
-			slog.InfoContext(
-				r.ctx, "attempting to create a runner in pool",
-				"pool_id", pool.ID,
-				"job_id", job.WorkflowJobID)
-			if err := r.addRunnerToPool(pool, jobLabels); err != nil {
-				slog.With(slog.Any("error", err)).ErrorContext(
-					r.ctx, "could not add runner to pool",
-					"pool_id", pool.ID)
-				continue
-			}
-			slog.DebugContext(r.ctx, "a new runner was added as a response to queued job",
-				"pool_id", pool.ID,
-				"job_id", job.WorkflowJobID)
-			runnerCreated = true
-			break
-		}
-
-		if !runnerCreated {
 			slog.WarnContext(
 				r.ctx, "could not create a runner for job; unlocking",
 				"job_id", job.WorkflowJobID)
@@ -2196,9 +2266,10 @@ func (r *basePoolManager) consumeQueuedJobs() error {
 					"job_id", job.WorkflowJobID)
 				return fmt.Errorf("error unlocking job: %w", err)
 			}
-		}
+			return nil
+		})
 	}
-	return nil
+	return reservations.Wait()
 }
 
 func (r *basePoolManager) UninstallWebhook(ctx context.Context) error {

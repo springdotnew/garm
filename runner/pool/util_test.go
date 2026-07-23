@@ -59,6 +59,28 @@ func TestPoolRoundRobinRollsOver(t *testing.T) {
 	}
 }
 
+func TestPoolRoundRobinCandidatesPreserveFallbackOrder(t *testing.T) {
+	p := &poolRoundRobin{
+		pools: []params.Pool{
+			{ID: "1"},
+			{ID: "2"},
+			{ID: "3"},
+		},
+	}
+
+	first, err := p.Candidates()
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	assertPoolIDs(t, first, []string{"1", "2", "3"})
+
+	second, err := p.Candidates()
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	assertPoolIDs(t, second, []string{"2", "3", "1"})
+}
+
 func TestPoolRoundRobinEmptyPoolErrorsOut(t *testing.T) {
 	p := &poolRoundRobin{}
 
@@ -68,6 +90,11 @@ func TestPoolRoundRobinEmptyPoolErrorsOut(t *testing.T) {
 	}
 	if err != runnerErrors.ErrNoPoolsAvailable {
 		t.Fatalf("expected ErrNoPoolsAvailable, got %s", err)
+	}
+
+	_, err = p.Candidates()
+	if err != runnerErrors.ErrNoPoolsAvailable {
+		t.Fatalf("expected ErrNoPoolsAvailable from Candidates, got %s", err)
 	}
 }
 
@@ -161,6 +188,12 @@ func TestPoolsForTagsPackGet(t *testing.T) {
 	if poolRR.next != 0 {
 		t.Fatalf("expected 0, got %d", poolRR.next)
 	}
+
+	candidates, err := poolRR.Candidates()
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	assertPoolIDs(t, candidates, []string{"2", "1"})
 }
 
 func TestPoolsForTagsRoundRobinGet(t *testing.T) {
@@ -238,5 +271,17 @@ func TestPoolsForTagsBalancerTypePack(t *testing.T) {
 	}
 	if poolCache.next != 0 {
 		t.Fatalf("expected 0, got %d", poolCache.next)
+	}
+}
+
+func assertPoolIDs(t *testing.T, actual []params.Pool, expected []string) {
+	t.Helper()
+	if len(actual) != len(expected) {
+		t.Fatalf("expected %d pools, got %d", len(expected), len(actual))
+	}
+	for index, expectedID := range expected {
+		if actual[index].ID != expectedID {
+			t.Fatalf("pool %d: expected %s, got %s", index, expectedID, actual[index].ID)
+		}
 	}
 }

@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -272,6 +273,71 @@ func (s *PoolStressTestSuite) TestConcurrentQueuedJobs() {
 	queuedJobs, err := s.store.ListJobsByStatus(s.adminCtx, params.JobStatusQueued)
 	s.Require().NoError(err)
 	s.Len(queuedJobs, numJobs, "expected %d queued jobs in DB", numJobs)
+}
+
+func (s *PoolStressTestSuite) TestConsumeQueuedJobsReservesRunnersConcurrently() {
+	const (
+		numJobs             = 8
+		requiredConcurrency = 4
+	)
+
+	s.providerMock.On("DisableJITConfig").Return(false)
+
+	started := make(chan struct{}, numJobs)
+	release := make(chan struct{})
+	var active int32
+	var maximum int32
+	s.ghcliMock.On(
+		"GetEntityJITConfig",
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+	).Run(func(mock.Arguments) {
+		current := atomic.AddInt32(&active, 1)
+		for {
+			observed := atomic.LoadInt32(&maximum)
+			if current <= observed || atomic.CompareAndSwapInt32(&maximum, observed, current) {
+				break
+			}
+		}
+		started <- struct{}{}
+		<-release
+		atomic.AddInt32(&active, -1)
+	}).Return(map[string]string{"encoded_jit_config": "test"}, nil, nil)
+
+	labels := []string{"self-hosted", "linux", "x64"}
+	for i := range numJobs {
+		job := s.makeWorkflowJob(int64(2500+i), "queued", "queued", "", labels)
+		s.Require().NoError(s.mgr.HandleWorkflowJob(job))
+	}
+	s.syncJobsFromDB()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.mgr.consumeQueuedJobs()
+	}()
+
+	reachedTarget := true
+	for range requiredConcurrency {
+		select {
+		case <-started:
+		case <-time.After(250 * time.Millisecond):
+			reachedTarget = false
+		}
+		if !reachedTarget {
+			break
+		}
+	}
+
+	close(release)
+	s.Require().NoError(<-done)
+	s.True(
+		reachedTarget,
+		"expected at least %d concurrent JIT reservations, observed %d",
+		requiredConcurrency,
+		atomic.LoadInt32(&maximum),
+	)
 }
 
 // TestJobStuckInQueuedWithMinIdleEqMaxRunners tests the key scenario where

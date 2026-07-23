@@ -11,6 +11,7 @@ import (
 )
 
 type poolCacheStore interface {
+	Candidates() ([]params.Pool, error)
 	Next() (params.Pool, error)
 	Reset()
 	Len() int
@@ -28,6 +29,20 @@ func (p *poolRoundRobin) Next() (params.Pool, error) {
 
 	n := atomic.AddUint32(&p.next, 1)
 	return p.pools[(int(n)-1)%len(p.pools)], nil
+}
+
+func (p *poolRoundRobin) Candidates() ([]params.Pool, error) {
+	if len(p.pools) == 0 {
+		return nil, runnerErrors.ErrNoPoolsAvailable
+	}
+
+	n := atomic.AddUint32(&p.next, 1)
+	start := (int(n) - 1) % len(p.pools)
+	candidates := make([]params.Pool, 0, len(p.pools))
+	for offset := range len(p.pools) {
+		candidates = append(candidates, p.pools[(start+offset)%len(p.pools)])
+	}
+	return candidates, nil
 }
 
 func (p *poolRoundRobin) Len() int {
