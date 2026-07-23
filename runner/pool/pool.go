@@ -2172,14 +2172,6 @@ func (r *basePoolManager) consumeQueuedJobs() error {
 			continue
 		}
 
-		if time.Since(job.UpdatedAt) < r.controllerInfo.JobBackoff() {
-			// give the idle runners a chance to pick up the job.
-			slog.DebugContext(
-				r.ctx, "job backoff not reached", "backoff_interval", r.controllerInfo.MinimumJobAgeBackoff,
-				"job_id", job.WorkflowJobID)
-			continue
-		}
-
 		if time.Since(job.UpdatedAt) >= time.Minute*10 {
 			// Job is still queued in our db, 10 minutes after a matching runner
 			// was spawned. Unlock it and try again. A different job may have picked up
@@ -2219,6 +2211,13 @@ func (r *basePoolManager) consumeQueuedJobs() error {
 
 		if poolRR.Len() == 0 {
 			slog.DebugContext(r.ctx, "could not find pools with labels", "requested_labels", strings.Join(job.Labels, ","))
+			continue
+		}
+
+		if time.Since(job.UpdatedAt) < r.controllerInfo.JobBackoff() && poolRR.MaintainsIdleRunners() {
+			slog.DebugContext(
+				r.ctx, "job backoff not reached", "backoff_interval", r.controllerInfo.MinimumJobAgeBackoff,
+				"job_id", job.WorkflowJobID)
 			continue
 		}
 
