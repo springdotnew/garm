@@ -138,14 +138,15 @@ func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instan
 		controllerInfo:      controllerInfo,
 		instanceTokenGetter: instanceTokenGetter,
 
-		store:       store,
-		providers:   providers,
-		quit:        make(chan struct{}),
-		jobs:        make(map[int64]params.Job),
-		checkedJobs: make(map[int64]time.Time),
-		wg:          wg,
-		backoff:     backoff,
-		consumer:    consumer,
+		store:                   store,
+		providers:               providers,
+		quit:                    make(chan struct{}),
+		jobs:                    make(map[int64]params.Job),
+		checkedJobs:             make(map[int64]time.Time),
+		wg:                      wg,
+		backoff:                 backoff,
+		consumer:                consumer,
+		pendingInstancesTrigger: make(chan struct{}, 1),
 	}
 	return repo, nil
 }
@@ -167,6 +168,8 @@ type basePoolManager struct {
 	tools       []commonParams.RunnerApplicationDownload
 	quit        chan struct{}
 	checkedJobs map[int64]time.Time
+
+	pendingInstancesTrigger chan struct{}
 
 	managerIsRunning   bool
 	managerErrorReason string
@@ -510,7 +513,13 @@ func jobIDFromLabels(labels []string) int64 {
 	return 0
 }
 
-func (r *basePoolManager) startLoopForFunction(f func() error, interval time.Duration, name string, alwaysRun bool) {
+func (r *basePoolManager) startLoopForFunction(
+	f func() error,
+	interval time.Duration,
+	name string,
+	alwaysRun bool,
+	trigger <-chan struct{},
+) {
 	slog.InfoContext(
 		r.ctx, "starting loop for entity",
 		"loop_name", name)
@@ -534,20 +543,21 @@ func (r *basePoolManager) startLoopForFunction(f func() error, interval time.Dur
 		case true:
 			select {
 			case <-ticker.C:
-				if err := f(); err != nil {
-					slog.With(slog.Any("error", err)).ErrorContext(
-						r.ctx, "error in loop",
-						"loop_name", name)
-					if errors.Is(err, runnerErrors.ErrUnauthorized) {
-						r.SetPoolRunningState(false, err.Error())
-					}
-				}
+			case <-trigger:
 			case <-r.ctx.Done():
 				// daemon is shutting down.
 				return
 			case <-r.quit:
 				// this worker was stopped.
 				return
+			}
+			if err := f(); err != nil {
+				slog.With(slog.Any("error", err)).ErrorContext(
+					r.ctx, "error in loop",
+					"loop_name", name)
+				if errors.Is(err, runnerErrors.ErrUnauthorized) {
+					r.SetPoolRunningState(false, err.Error())
+				}
 			}
 		default:
 			select {
@@ -1944,16 +1954,16 @@ func (r *basePoolManager) Start() error {
 		case <-initializeEntity:
 		}
 		defer close(initializeEntity)
-		go r.startLoopForFunction(r.runnerCleanup, common.PoolReapTimeoutInterval, "timeout_reaper", false)
-		go r.startLoopForFunction(r.scaleDown, common.PoolScaleDownInterval, "scale_down", false)
+		go r.startLoopForFunction(r.runnerCleanup, common.PoolReapTimeoutInterval, "timeout_reaper", false, nil)
+		go r.startLoopForFunction(r.scaleDown, common.PoolScaleDownInterval, "scale_down", false, nil)
 		// always run the delete pending instances routine. This way we can still remove existing runners, even if the pool is not running.
-		go r.startLoopForFunction(r.deletePendingInstances, common.PoolConsilitationInterval, "consolidate[delete_pending]", true)
-		go r.startLoopForFunction(r.addPendingInstances, common.PoolConsilitationInterval, "consolidate[add_pending]", false)
-		go r.startLoopForFunction(r.ensureMinIdleRunners, common.PoolConsilitationInterval, "consolidate[ensure_min_idle]", false)
-		go r.startLoopForFunction(r.retryFailedInstances, common.PoolConsilitationInterval, "consolidate[retry_failed]", false)
-		go r.startLoopForFunction(r.updateTools, common.PoolToolUpdateInterval, "update_tools", true)
-		go r.startLoopForFunction(r.consumeQueuedJobs, common.PoolConsilitationInterval, "job_queue_consumer", false)
-		go r.startLoopForFunction(r.reconcileStaleJobs, common.PoolStaleJobReconcileInterval, "stale_job_reconciler", false)
+		go r.startLoopForFunction(r.deletePendingInstances, common.PoolConsilitationInterval, "consolidate[delete_pending]", true, nil)
+		go r.startLoopForFunction(r.addPendingInstances, common.PoolConsilitationInterval, "consolidate[add_pending]", false, r.pendingInstancesTrigger)
+		go r.startLoopForFunction(r.ensureMinIdleRunners, common.PoolConsilitationInterval, "consolidate[ensure_min_idle]", false, nil)
+		go r.startLoopForFunction(r.retryFailedInstances, common.PoolConsilitationInterval, "consolidate[retry_failed]", false, nil)
+		go r.startLoopForFunction(r.updateTools, common.PoolToolUpdateInterval, "update_tools", true, nil)
+		go r.startLoopForFunction(r.consumeQueuedJobs, common.PoolConsilitationInterval, "job_queue_consumer", false, nil)
+		go r.startLoopForFunction(r.reconcileStaleJobs, common.PoolStaleJobReconcileInterval, "stale_job_reconciler", false, nil)
 	}()
 	return nil
 }
@@ -2254,6 +2264,10 @@ func (r *basePoolManager) consumeQueuedJobs() error {
 					"pool_id", pool.ID,
 					"job_id", job.WorkflowJobID,
 					"reservation_duration", time.Since(startedAt))
+				select {
+				case r.pendingInstancesTrigger <- struct{}{}:
+				default:
+				}
 				return nil
 			}
 

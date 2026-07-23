@@ -340,6 +340,43 @@ func (s *PoolStressTestSuite) TestConsumeQueuedJobsReservesRunnersConcurrently()
 	)
 }
 
+func TestLoopTriggerRunsFunctionBeforeInterval(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	manager := &basePoolManager{
+		ctx:              ctx,
+		quit:             make(chan struct{}),
+		wg:               &sync.WaitGroup{},
+		managerIsRunning: true,
+	}
+	trigger := make(chan struct{}, 1)
+	called := make(chan struct{}, 1)
+
+	go manager.startLoopForFunction(
+		func() error {
+			called <- struct{}{}
+			return nil
+		},
+		time.Hour,
+		"trigger_test",
+		false,
+		trigger,
+	)
+
+	trigger <- struct{}{}
+	select {
+	case <-called:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("expected trigger to run function before polling interval")
+	}
+
+	cancel()
+	if err := manager.Wait(); err != nil {
+		t.Fatalf("wait for triggered loop: %v", err)
+	}
+}
+
 // TestJobStuckInQueuedWithMinIdleEqMaxRunners tests the key scenario where
 // min_idle_runners == max_runners and jobs should not get stuck.
 func (s *PoolStressTestSuite) TestJobStuckInQueuedWithMinIdleEqMaxRunners() {
