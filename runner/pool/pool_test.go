@@ -377,6 +377,56 @@ func TestLoopTriggerRunsFunctionBeforeInterval(t *testing.T) {
 	}
 }
 
+func TestQueuedJobTriggerPreservesBackoffAndRunsBeforeInterval(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	manager := &basePoolManager{
+		ctx:               ctx,
+		quit:              make(chan struct{}),
+		wg:                &sync.WaitGroup{},
+		managerIsRunning:  true,
+		queuedJobsTrigger: make(chan struct{}, 1),
+		controllerInfo: params.ControllerInfo{
+			MinimumJobAgeBackoff: 1,
+		},
+	}
+	called := make(chan time.Time, 1)
+	startedAt := time.Now()
+
+	go manager.startLoopForFunction(
+		func() error {
+			called <- time.Now()
+			return nil
+		},
+		time.Hour,
+		"queued_jobs_trigger_test",
+		false,
+		manager.queuedJobsTrigger,
+	)
+
+	manager.triggerQueuedJobsAfterBackoff()
+	select {
+	case <-called:
+		t.Fatal("expected queued job trigger to preserve the configured backoff")
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	select {
+	case calledAt := <-called:
+		if elapsed := calledAt.Sub(startedAt); elapsed < time.Second {
+			t.Fatalf("queued job trigger ran before backoff: %s", elapsed)
+		}
+	case <-time.After(1500 * time.Millisecond):
+		t.Fatal("expected queued job trigger to run before the polling interval")
+	}
+
+	cancel()
+	if err := manager.Wait(); err != nil {
+		t.Fatalf("wait for queued job trigger loop: %v", err)
+	}
+}
+
 // TestJobStuckInQueuedWithMinIdleEqMaxRunners tests the key scenario where
 // min_idle_runners == max_runners and jobs should not get stuck.
 func (s *PoolStressTestSuite) TestJobStuckInQueuedWithMinIdleEqMaxRunners() {

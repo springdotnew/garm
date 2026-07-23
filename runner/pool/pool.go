@@ -147,6 +147,7 @@ func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instan
 		backoff:                 backoff,
 		consumer:                consumer,
 		pendingInstancesTrigger: make(chan struct{}, 1),
+		queuedJobsTrigger:       make(chan struct{}, 1),
 	}
 	return repo, nil
 }
@@ -170,6 +171,7 @@ type basePoolManager struct {
 	checkedJobs map[int64]time.Time
 
 	pendingInstancesTrigger chan struct{}
+	queuedJobsTrigger       chan struct{}
 
 	managerIsRunning   bool
 	managerErrorReason string
@@ -478,7 +480,7 @@ func (r *basePoolManager) HandleWorkflowJob(job params.WorkflowJob) error {
 
 	switch job.Action {
 	case "queued":
-		// Queued jobs are just recorded; they'll be picked up by consumeQueuedJobs()
+		r.triggerQueuedJobsAfterBackoff()
 	case "in_progress":
 		triggeredBy, inProgressErr := r.handleInProgressJob(ctx, jobParams)
 		actionErr = inProgressErr
@@ -497,6 +499,32 @@ func (r *basePoolManager) HandleWorkflowJob(job params.WorkflowJob) error {
 	slog.DebugContext(ctx, "workflow job processed", "workflow_job_id", jobParams.WorkflowJobID, "job_action", job.Action)
 
 	return actionErr
+}
+
+func (r *basePoolManager) triggerQueuedJobsAfterBackoff() {
+	backoff := r.controllerInfo.JobBackoff()
+	if backoff == 0 {
+		select {
+		case r.queuedJobsTrigger <- struct{}{}:
+		default:
+		}
+		return
+	}
+
+	time.AfterFunc(backoff, func() {
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-r.quit:
+			return
+		default:
+		}
+
+		select {
+		case r.queuedJobsTrigger <- struct{}{}:
+		default:
+		}
+	})
 }
 
 func jobIDFromLabels(labels []string) int64 {
@@ -1962,7 +1990,7 @@ func (r *basePoolManager) Start() error {
 		go r.startLoopForFunction(r.ensureMinIdleRunners, common.PoolConsilitationInterval, "consolidate[ensure_min_idle]", false, nil)
 		go r.startLoopForFunction(r.retryFailedInstances, common.PoolConsilitationInterval, "consolidate[retry_failed]", false, nil)
 		go r.startLoopForFunction(r.updateTools, common.PoolToolUpdateInterval, "update_tools", true, nil)
-		go r.startLoopForFunction(r.consumeQueuedJobs, common.PoolConsilitationInterval, "job_queue_consumer", false, nil)
+		go r.startLoopForFunction(r.consumeQueuedJobs, common.PoolConsilitationInterval, "job_queue_consumer", false, r.queuedJobsTrigger)
 		go r.startLoopForFunction(r.reconcileStaleJobs, common.PoolStaleJobReconcileInterval, "stale_job_reconciler", false, nil)
 	}()
 	return nil
