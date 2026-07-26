@@ -111,21 +111,29 @@ func (s *PoolStressTestSuite) SetupTest() {
 	s.Require().NoError(err)
 
 	s.mgr = &basePoolManager{
-		ctx:              s.adminCtx,
-		consumerID:       "test-consumer",
-		entity:           entity,
-		store:            db,
-		controllerInfo:   s.controllerInfo,
-		providers:        map[string]common.Provider{"test-provider": s.providerMock},
-		jobs:             make(map[int64]params.Job),
-		checkedJobs:      make(map[int64]time.Time),
-		quit:             make(chan struct{}),
-		consumer:         &garmTesting.MockConsumer{},
-		wg:               &sync.WaitGroup{},
-		backoff:          backoff,
-		ghcli:            s.ghcliMock,
-		managerIsRunning: true,
+		ctx:                     s.adminCtx,
+		consumerID:              "test-consumer",
+		entity:                  entity,
+		store:                   db,
+		controllerInfo:          s.controllerInfo,
+		providers:               map[string]common.Provider{"test-provider": s.providerMock},
+		jobs:                    make(map[int64]params.Job),
+		checkedJobs:             make(map[int64]time.Time),
+		quit:                    make(chan struct{}),
+		consumer:                &garmTesting.MockConsumer{},
+		wg:                      &sync.WaitGroup{},
+		backoff:                 backoff,
+		ghcli:                   s.ghcliMock,
+		managerIsRunning:        true,
+		pendingInstancesTrigger: make(chan struct{}, 1),
+		queuedJobsTrigger:       make(chan struct{}, 1),
 	}
+}
+
+func (s *PoolStressTestSuite) TearDownTest() {
+	s.mgr.mux.Lock()
+	s.mgr.stopQueuedJobsWakeLocked()
+	s.mgr.mux.Unlock()
 }
 
 // makeWorkflowJob creates a params.WorkflowJob matching the test entity.
@@ -474,6 +482,132 @@ func TestLoopTriggerRunsFunctionBeforeInterval(t *testing.T) {
 	}
 }
 
+func TestQueuedJobTriggerPreservesBackoffAndRunsBeforeInterval(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	manager := &basePoolManager{
+		ctx:               ctx,
+		quit:              make(chan struct{}),
+		wg:                &sync.WaitGroup{},
+		managerIsRunning:  true,
+		queuedJobsTrigger: make(chan struct{}, 1),
+		controllerInfo: params.ControllerInfo{
+			MinimumJobAgeBackoff: 1,
+		},
+	}
+	called := make(chan time.Time, 1)
+	startedAt := time.Now()
+
+	go manager.startLoopForFunction(
+		func() error {
+			called <- time.Now()
+			return nil
+		},
+		time.Hour,
+		"queued_jobs_trigger_test",
+		false,
+		manager.queuedJobsTrigger,
+	)
+
+	manager.triggerQueuedJobsAfterBackoff()
+	select {
+	case <-called:
+		t.Fatal("expected queued job trigger to preserve the configured backoff")
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	select {
+	case calledAt := <-called:
+		if elapsed := calledAt.Sub(startedAt); elapsed < time.Second {
+			t.Fatalf("queued job trigger ran before backoff: %s", elapsed)
+		}
+	case <-time.After(1500 * time.Millisecond):
+		t.Fatal("expected queued job trigger to run before the polling interval")
+	}
+
+	cancel()
+	if err := manager.Wait(); err != nil {
+		t.Fatalf("wait for queued job trigger loop: %v", err)
+	}
+}
+
+func TestQueuedJobTriggersCoalesceScheduledWake(t *testing.T) {
+	manager := &basePoolManager{
+		ctx:               context.Background(),
+		quit:              make(chan struct{}),
+		queuedJobsTrigger: make(chan struct{}, 1),
+		controllerInfo: params.ControllerInfo{
+			MinimumJobAgeBackoff: 60,
+		},
+	}
+
+	for range 5000 {
+		manager.triggerQueuedJobsAfterBackoff()
+	}
+
+	manager.mux.Lock()
+	if manager.queuedJobsWakeTimer == nil {
+		manager.mux.Unlock()
+		t.Fatal("expected one scheduled queued-job wake")
+	}
+	if manager.queuedJobsWakeGeneration != 1 {
+		generation := manager.queuedJobsWakeGeneration
+		manager.mux.Unlock()
+		t.Fatalf("expected one timer generation for the burst, got %d", generation)
+	}
+	manager.mux.Unlock()
+
+	controllerInfo := manager.controllerInfoSnapshot()
+	controllerInfo.MinimumJobAgeBackoff = 0
+	manager.handleControllerUpdateEvent(controllerInfo)
+
+	select {
+	case <-manager.queuedJobsTrigger:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("expected a backoff reduction to wake queued jobs immediately")
+	}
+
+	manager.mux.Lock()
+	defer manager.mux.Unlock()
+	if manager.queuedJobsWakeTimer != nil {
+		t.Fatal("expected the coalesced timer to be cleared after the immediate wake")
+	}
+}
+
+func TestQueuedJobTriggerControllerUpdatesAreRaceFree(t *testing.T) {
+	manager := &basePoolManager{
+		ctx:               context.Background(),
+		quit:              make(chan struct{}),
+		queuedJobsTrigger: make(chan struct{}, 1),
+		controllerInfo: params.ControllerInfo{
+			MinimumJobAgeBackoff: 1,
+		},
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for range 1000 {
+			manager.triggerQueuedJobsAfterBackoff()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := range 1000 {
+			controllerInfo := manager.controllerInfoSnapshot()
+			controllerInfo.MinimumJobAgeBackoff = uint(i%2 + 1)
+			manager.handleControllerUpdateEvent(controllerInfo)
+		}
+	}()
+	wg.Wait()
+
+	manager.mux.Lock()
+	manager.stopQueuedJobsWakeLocked()
+	manager.mux.Unlock()
+}
+
 // TestJobStuckInQueuedWithMinIdleEqMaxRunners tests the key scenario where
 // min_idle_runners == max_runners and jobs should not get stuck.
 func (s *PoolStressTestSuite) TestJobStuckInQueuedWithMinIdleEqMaxRunners() {
@@ -654,7 +788,9 @@ func (s *PoolStressTestSuite) TestConsumeQueuedJobsRespectsBackoff() {
 	labels := []string{"self-hosted", "linux", "x64"}
 
 	// Set a 5-second backoff
-	s.mgr.controllerInfo.MinimumJobAgeBackoff = 5
+	controllerInfo := s.mgr.controllerInfoSnapshot()
+	controllerInfo.MinimumJobAgeBackoff = 5
+	s.mgr.handleControllerUpdateEvent(controllerInfo)
 
 	// Insert a queued job that was just created (UpdatedAt = now)
 	job := params.Job{
@@ -685,7 +821,8 @@ func (s *PoolStressTestSuite) TestConsumeQueuedJobsRespectsBackoff() {
 	s.Equal(uuid.UUID{}, queuedJobs[0].LockedBy, "job should not be locked during backoff")
 
 	// Now set backoff to 0 and retry — job should be consumed
-	s.mgr.controllerInfo.MinimumJobAgeBackoff = 0
+	controllerInfo.MinimumJobAgeBackoff = 0
+	s.mgr.handleControllerUpdateEvent(controllerInfo)
 	s.syncJobsFromDB()
 
 	err = s.mgr.consumeQueuedJobs()
