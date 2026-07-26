@@ -17,6 +17,9 @@ package templates
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -184,5 +187,126 @@ func TestInstallTemplatesRenderForceInsecure(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestLinuxInstallWrapperSerializesBootstrapWithoutTracingToken(t *testing.T) {
+	t.Parallel()
+
+	wrapper, err := RenderRunnerInstallWrapper(
+		context.Background(),
+		commonParams.Linux,
+		"https://controller.example/metadata",
+		"https://controller.example/callbacks",
+		"sensitive-token",
+		commonParams.ProxyConfig{},
+	)
+	if err != nil {
+		t.Fatalf("failed to render wrapper: %v", err)
+	}
+
+	rendered := string(wrapper)
+	for _, needle := range []string{
+		`mkdir "$LOCK_DIR"`,
+		`if [[ -e "$DONE_FILE" ]]`,
+		`touch "$DONE_FILE"`,
+	} {
+		if !strings.Contains(rendered, needle) {
+			t.Errorf("expected %q in rendered wrapper", needle)
+		}
+	}
+	for _, needle := range []string{"set -x", "set -ex"} {
+		if strings.Contains(rendered, needle) {
+			t.Errorf("did not expect %q in rendered wrapper", needle)
+		}
+	}
+	if strings.Contains(rendered, "flock") {
+		t.Error("did not expect the generic wrapper to require flock")
+	}
+	if strings.Index(rendered, `mkdir "$LOCK_DIR"`) >= strings.Index(rendered, `curl -H`) {
+		t.Error("expected bootstrap lock before metadata download")
+	}
+	if strings.Index(rendered, `/tmp/real-install.sh`) >= strings.Index(rendered, `touch "$DONE_FILE"`) {
+		t.Error("expected completion marker after the install script")
+	}
+}
+
+func TestLinuxInstallWrapperRunsConcurrentBootstrapOnce(t *testing.T) {
+	t.Parallel()
+
+	wrapper, err := RenderRunnerInstallWrapper(
+		context.Background(),
+		commonParams.Linux,
+		"https://controller.example/metadata",
+		"https://controller.example/callbacks",
+		"sensitive-token",
+		commonParams.ProxyConfig{},
+	)
+	if err != nil {
+		t.Fatalf("failed to render wrapper: %v", err)
+	}
+
+	tempDir := t.TempDir()
+	binDir := filepath.Join(tempDir, "bin")
+	if err := os.Mkdir(binDir, 0o755); err != nil {
+		t.Fatalf("failed to create bin directory: %v", err)
+	}
+	countPath := filepath.Join(tempDir, "install-count")
+	fakeCurl := filepath.Join(binDir, "curl")
+	fakeCurlScript := `#!/bin/bash
+set -e
+output=
+while (( $# > 0 )); do
+	if [[ "$1" == "-o" ]]; then
+		output="$2"
+		shift 2
+		continue
+	fi
+	shift
+done
+cat > "$output" <<'EOF'
+#!/bin/bash
+printf 'run\n' >> "$RUN_COUNT_FILE"
+sleep 0.2
+EOF
+printf 200
+`
+	if err := os.WriteFile(fakeCurl, []byte(fakeCurlScript), 0o755); err != nil {
+		t.Fatalf("failed to write fake curl: %v", err)
+	}
+
+	rendered := strings.NewReplacer(
+		"/tmp/garm-runner-bootstrap.lock", filepath.Join(tempDir, "bootstrap.lock"),
+		"/tmp/garm-runner-bootstrap.done", filepath.Join(tempDir, "bootstrap.done"),
+		"/tmp/real-install.sh", filepath.Join(tempDir, "install.sh"),
+	).Replace(string(wrapper))
+	wrapperPath := filepath.Join(tempDir, "wrapper.sh")
+	if err := os.WriteFile(wrapperPath, []byte(rendered), 0o755); err != nil {
+		t.Fatalf("failed to write wrapper: %v", err)
+	}
+
+	run := func() error {
+		cmd := exec.CommandContext(context.Background(), "bash", wrapperPath)
+		cmd.Env = append(os.Environ(),
+			"PATH="+binDir+":"+os.Getenv("PATH"),
+			"RUN_COUNT_FILE="+countPath,
+		)
+		return cmd.Run()
+	}
+	results := make(chan error, 2)
+	go func() { results <- run() }()
+	go func() { results <- run() }()
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("wrapper failed: %v", err)
+		}
+	}
+
+	count, err := os.ReadFile(countPath)
+	if err != nil {
+		t.Fatalf("failed to read install count: %v", err)
+	}
+	if got := strings.Count(string(count), "run\n"); got != 1 {
+		t.Fatalf("expected one install execution, got %d", got)
 	}
 }
