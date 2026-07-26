@@ -24,12 +24,18 @@ var ghClientCache *GithubClientCache
 type GithubClientCache struct {
 	mux sync.Mutex
 
-	cache map[string]common.GithubClient
+	cache      map[string]githubClientCacheEntry
+	generation uint64
+}
+
+type githubClientCacheEntry struct {
+	client     common.GithubClient
+	generation uint64
 }
 
 func init() {
 	clientCache := &GithubClientCache{
-		cache: make(map[string]common.GithubClient),
+		cache: make(map[string]githubClientCacheEntry),
 	}
 	ghClientCache = clientCache
 }
@@ -38,17 +44,26 @@ func (g *GithubClientCache) SetClient(entityID string, client common.GithubClien
 	g.mux.Lock()
 	defer g.mux.Unlock()
 
-	g.cache[entityID] = client
+	g.generation++
+	g.cache[entityID] = githubClientCacheEntry{
+		client:     client,
+		generation: g.generation,
+	}
 }
 
 func (g *GithubClientCache) GetClient(entityID string) (common.GithubClient, bool) {
+	client, _, ok := g.GetClientVersion(entityID)
+	return client, ok
+}
+
+func (g *GithubClientCache) GetClientVersion(entityID string) (common.GithubClient, uint64, bool) {
 	g.mux.Lock()
 	defer g.mux.Unlock()
 
-	if client, ok := g.cache[entityID]; ok {
-		return client, true
+	if entry, ok := g.cache[entityID]; ok {
+		return entry.client, entry.generation, true
 	}
-	return nil, false
+	return nil, 0, false
 }
 
 func (g *GithubClientCache) DeleteClient(entityID string) {
@@ -64,6 +79,10 @@ func SetGithubClient(entityID string, client common.GithubClient) {
 
 func GetGithubClient(entityID string) (common.GithubClient, bool) {
 	return ghClientCache.GetClient(entityID)
+}
+
+func GetGithubClientVersion(entityID string) (common.GithubClient, uint64, bool) {
+	return ghClientCache.GetClientVersion(entityID)
 }
 
 func DeleteGithubClient(entityID string) {

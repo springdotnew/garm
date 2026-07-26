@@ -15,12 +15,17 @@ package scaleset
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	commonParams "github.com/cloudbase/garm-provider-common/params"
+	"github.com/cloudbase/garm/cache"
 	dbCommon "github.com/cloudbase/garm/database/common"
 	"github.com/cloudbase/garm/params"
+	commonMocks "github.com/cloudbase/garm/runner/common/mocks"
+	githubScaleSets "github.com/cloudbase/garm/util/github/scalesets"
 )
 
 type testConsumer struct {
@@ -38,6 +43,64 @@ func (c *testConsumer) IsClosed() bool {
 func (c *testConsumer) Close() {}
 
 func (c *testConsumer) SetFilters(_ ...dbCommon.PayloadFilterFunc) {}
+
+func TestGetScaleSetClientReusesCurrentCacheGeneration(t *testing.T) {
+	const entityID = "entity-id"
+	githubClient := commonMocks.NewGithubClient(t)
+	cache.SetGithubClient(entityID, githubClient)
+	t.Cleanup(func() { cache.DeleteGithubClient(entityID) })
+
+	w := &Worker{scaleSet: params.ScaleSet{OrgID: entityID}}
+	const callers = 16
+	clients := make(chan *githubScaleSets.ScaleSetClient, callers)
+	var callersDone sync.WaitGroup
+	callersDone.Add(callers)
+	for range callers {
+		go func() {
+			defer callersDone.Done()
+			client, err := w.GetScaleSetClient()
+			if err != nil {
+				t.Errorf("GetScaleSetClient() error = %v", err)
+				return
+			}
+			clients <- client
+		}()
+	}
+	callersDone.Wait()
+	close(clients)
+
+	var first *githubScaleSets.ScaleSetClient
+	for client := range clients {
+		if first == nil {
+			first = client
+			continue
+		}
+		if client != first {
+			t.Fatal("concurrent callers received different scale-set clients")
+		}
+	}
+}
+
+func TestGetScaleSetClientRebuildsAfterGithubClientReplacement(t *testing.T) {
+	const entityID = "entity-id"
+	cache.SetGithubClient(entityID, commonMocks.NewGithubClient(t))
+	t.Cleanup(func() { cache.DeleteGithubClient(entityID) })
+
+	w := &Worker{scaleSet: params.ScaleSet{OrgID: entityID}}
+	first, err := w.GetScaleSetClient()
+	if err != nil {
+		t.Fatalf("GetScaleSetClient() error = %v", err)
+	}
+
+	cache.SetGithubClient(entityID, commonMocks.NewGithubClient(t))
+	second, err := w.GetScaleSetClient()
+	if err != nil {
+		t.Fatalf("GetScaleSetClient() after replacement error = %v", err)
+	}
+	if second == first {
+		t.Fatal("GitHub client replacement reused stale scale-set client")
+	}
+}
 
 func TestRunnerCountIncludesActiveButNotTerminatedCapacity(t *testing.T) {
 	w := &Worker{
@@ -98,6 +161,174 @@ func TestRunnerCanScaleDownOnlyAfterIdleGrace(t *testing.T) {
 				t.Fatalf("runnerCanScaleDown() = %t, want %t", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRunnerCreationsToStart(t *testing.T) {
+	tests := []struct {
+		name          string
+		target        int
+		current       int
+		inFlight      int
+		wantCreations int
+	}{
+		{name: "full burst", target: 32, wantCreations: 32},
+		{name: "demand grows during first wave", target: 32, inFlight: 24, wantCreations: 8},
+		{name: "existing and in flight satisfy target", target: 32, current: 20, inFlight: 12},
+		{name: "concurrency cap", target: 40, wantCreations: 32},
+		{name: "one slot remains", target: 40, current: 8, inFlight: 31, wantCreations: 1},
+		{name: "target decreased", target: 4, current: 4, inFlight: 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := runnerCreationsToStart(tt.target, tt.current, tt.inFlight); got != tt.wantCreations {
+				t.Fatalf("runnerCreationsToStart() = %d, want %d", got, tt.wantCreations)
+			}
+		})
+	}
+}
+
+func TestStartRunnerCreationsDoesNotWaitForFirstWave(t *testing.T) {
+	const runnerCount = 32
+	started := make(chan struct{}, runnerCount)
+	release := make(chan struct{})
+
+	startRunnerCreations(runnerCount, func() {
+		started <- struct{}{}
+		<-release
+	})
+
+	for range runnerCount {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			close(release)
+			t.Fatal("runner creations did not fan out without waiting for the first wave")
+		}
+	}
+	close(release)
+}
+
+func TestRunnerCreationStillNeededFailsClosed(t *testing.T) {
+	newWorker := func() *Worker {
+		return &Worker{
+			scaleSet: params.ScaleSet{
+				ID:                 1,
+				Enabled:            true,
+				MaxRunners:         8,
+				DesiredRunnerCount: 8,
+			},
+			runners:           make(map[string]params.Instance),
+			creationsInFlight: 8,
+			quit:              make(chan struct{}),
+		}
+	}
+
+	w := newWorker()
+	if !w.runnerCreationStillNeeded(1, w.quit) {
+		t.Fatal("exactly reserved creation was rejected")
+	}
+
+	w = newWorker()
+	w.scaleSet.DesiredRunnerCount = 7
+	if w.runnerCreationStillNeeded(1, w.quit) {
+		t.Fatal("creation survived a target decrease")
+	}
+
+	w = newWorker()
+	w.scaleSet.Enabled = false
+	if w.runnerCreationStillNeeded(1, w.quit) {
+		t.Fatal("creation survived scale-set disable")
+	}
+
+	w = newWorker()
+	if w.runnerCreationStillNeeded(2, w.quit) {
+		t.Fatal("creation survived scale-set replacement")
+	}
+
+	w = newWorker()
+	workerQuit := w.quit
+	close(workerQuit)
+	w.quit = make(chan struct{})
+	if w.runnerCreationStillNeeded(1, workerQuit) {
+		t.Fatal("creation survived its worker generation stopping")
+	}
+}
+
+func TestCreationCompletionDoesNotOverwriteNewerRunnerSnapshot(t *testing.T) {
+	createdAt := time.Date(2026, time.July, 26, 12, 0, 0, 0, time.UTC)
+	pendingCreate := params.Instance{
+		ID:        "runner-id",
+		Name:      "runner",
+		Status:    commonParams.InstancePendingCreate,
+		UpdatedAt: createdAt,
+	}
+	running := pendingCreate
+	running.Status = commonParams.InstanceRunning
+	running.RunnerStatus = params.RunnerIdle
+	running.UpdatedAt = createdAt.Add(time.Second)
+
+	w := &Worker{
+		ctx:               context.Background(),
+		runners:           make(map[string]params.Instance),
+		runnerSnapshots:   make(map[string]time.Time),
+		creationsInFlight: 1,
+		autoScaleWake:     make(chan struct{}, 1),
+	}
+
+	w.handleInstanceEntityEvent(dbCommon.ChangePayload{
+		EntityType: dbCommon.InstanceEntityType,
+		Operation:  dbCommon.UpdateOperation,
+		Payload:    running,
+	})
+	w.finishRunnerCreation(&pendingCreate)
+	w.handleInstanceEntityEvent(dbCommon.ChangePayload{
+		EntityType: dbCommon.InstanceEntityType,
+		Operation:  dbCommon.CreateOperation,
+		Payload:    pendingCreate,
+	})
+
+	got := w.runners[pendingCreate.ID]
+	if got.Status != commonParams.InstanceRunning {
+		t.Fatalf("runner status regressed to %s, want %s", got.Status, commonParams.InstanceRunning)
+	}
+	if !got.UpdatedAt.Equal(running.UpdatedAt) {
+		t.Fatalf("runner updated at = %s, want %s", got.UpdatedAt, running.UpdatedAt)
+	}
+}
+
+func TestLateFailedCreationImmediatelyOpensReplacement(t *testing.T) {
+	const target = 32
+	runners := make(map[string]params.Instance, target-1)
+	for i := range target - 1 {
+		id := fmt.Sprintf("runner-%d", i)
+		runners[id] = params.Instance{
+			ID:           id,
+			Status:       commonParams.InstanceRunning,
+			RunnerStatus: params.RunnerIdle,
+		}
+	}
+	w := &Worker{
+		scaleSet: params.ScaleSet{
+			Enabled:            true,
+			MaxRunners:         target,
+			DesiredRunnerCount: target,
+		},
+		runners:           runners,
+		creationsInFlight: 1,
+		autoScaleWake:     make(chan struct{}, 1),
+	}
+
+	w.finishRunnerCreation(nil)
+
+	select {
+	case <-w.autoScaleWake:
+	case <-time.After(time.Second):
+		t.Fatal("failed creation did not immediately wake autoscaler")
+	}
+	if got, want := runnerCreationsToStart(w.targetRunners(), w.runnerCount(), w.creationsInFlight), 1; got != want {
+		t.Fatalf("replacement creations = %d, want %d", got, want)
 	}
 }
 

@@ -24,11 +24,12 @@ import (
 )
 
 func (s *ScaleSetClient) newActionsRequest(ctx context.Context, method, uriPath string, body io.Reader) (*http.Request, error) {
-	if err := s.ensureAdminInfo(ctx); err != nil {
+	actionsServiceInfo, err := s.actionsServiceInfoSnapshot(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("failed to update token: %w", err)
 	}
 
-	actionsURI, err := s.actionsServiceInfo.GetURL()
+	actionsURI, err := actionsServiceInfo.GetURL()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pipeline URL: %w", err)
 	}
@@ -59,7 +60,7 @@ func (s *ScaleSetClient) newActionsRequest(ctx context.Context, method, uriPath 
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", s.actionsServiceInfo.Token))
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", actionsServiceInfo.Token))
 
 	return req, nil
 }
