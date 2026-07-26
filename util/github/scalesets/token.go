@@ -85,7 +85,10 @@ func (s *ScaleSetClient) getActionServiceInfo(ctx context.Context) (_ params.Act
 func (s *ScaleSetClient) ensureAdminInfo(ctx context.Context) error {
 	s.mux.Lock()
 	defer s.mux.Unlock()
+	return s.ensureAdminInfoLocked(ctx)
+}
 
+func (s *ScaleSetClient) ensureAdminInfoLocked(ctx context.Context) error {
 	var expiresAt time.Time
 	if s.runnerRegistrationToken != nil {
 		expiresAt = s.runnerRegistrationToken.GetExpiresAt().Time
@@ -109,4 +112,14 @@ func (s *ScaleSetClient) ensureAdminInfo(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (s *ScaleSetClient) actionsServiceInfoSnapshot(ctx context.Context) (params.ActionsServiceAdminInfoResponse, error) {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+
+	if err := s.ensureAdminInfoLocked(ctx); err != nil {
+		return params.ActionsServiceAdminInfoResponse{}, err
+	}
+	return *s.actionsServiceInfo, nil
 }
