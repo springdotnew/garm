@@ -190,6 +190,7 @@ func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instan
 		backoff:                 backoff,
 		consumer:                consumer,
 		pendingInstancesTrigger: make(chan struct{}, 1),
+		queuedJobsTrigger:       make(chan struct{}, 1),
 	}
 	return repo, nil
 }
@@ -212,7 +213,12 @@ type basePoolManager struct {
 	quit        chan struct{}
 	checkedJobs map[int64]time.Time
 
-	pendingInstancesTrigger chan struct{}
+	pendingInstancesTrigger  chan struct{}
+	queuedJobsTrigger        chan struct{}
+	queuedJobsWakeTimer      *time.Timer
+	queuedJobsWakeStartedAt  time.Time
+	queuedJobsWakeDeadline   time.Time
+	queuedJobsWakeGeneration uint64
 
 	managerIsRunning   bool
 	managerErrorReason string
@@ -230,6 +236,18 @@ func (r *basePoolManager) getProviderBaseParams(pool params.Pool) common.Provide
 		PoolInfo:       pool,
 		ControllerInfo: r.controllerInfo,
 	}
+}
+
+func (r *basePoolManager) controllerInfoSnapshot() params.ControllerInfo {
+	r.mux.Lock()
+	defer r.mux.Unlock()
+	return r.controllerInfo
+}
+
+func (r *basePoolManager) isRunning() bool {
+	r.mux.Lock()
+	defer r.mux.Unlock()
+	return r.managerIsRunning
 }
 
 // isEntityPool checks if a pool belongs to this manager's entity
@@ -529,7 +547,7 @@ func (r *basePoolManager) HandleWorkflowJob(job params.WorkflowJob) error {
 
 	switch job.Action {
 	case "queued":
-		// Queued jobs are just recorded; they'll be picked up by consumeQueuedJobs()
+		r.triggerQueuedJobsAfterBackoff()
 	case "in_progress":
 		triggeredBy, inProgressErr := r.handleInProgressJob(ctx, jobParams)
 		actionErr = inProgressErr
@@ -548,6 +566,93 @@ func (r *basePoolManager) HandleWorkflowJob(job params.WorkflowJob) error {
 	slog.DebugContext(ctx, "workflow job processed", "workflow_job_id", jobParams.WorkflowJobID, "job_action", job.Action)
 
 	return actionErr
+}
+
+func (r *basePoolManager) triggerQueuedJobsAfterBackoff() {
+	startedAt := time.Now()
+
+	r.mux.Lock()
+	deadline := startedAt.Add(r.controllerInfo.JobBackoff())
+	if !deadline.After(startedAt) {
+		r.mux.Unlock()
+		r.triggerQueuedJobs()
+		return
+	}
+	if r.queuedJobsWakeTimer != nil && !deadline.Before(r.queuedJobsWakeDeadline) {
+		r.mux.Unlock()
+		return
+	}
+	r.scheduleQueuedJobsWakeLocked(startedAt, deadline)
+	r.mux.Unlock()
+}
+
+func (r *basePoolManager) triggerQueuedJobs() {
+	select {
+	case <-r.ctx.Done():
+		return
+	case <-r.quit:
+		return
+	default:
+	}
+
+	select {
+	case r.queuedJobsTrigger <- struct{}{}:
+	default:
+	}
+}
+
+func (r *basePoolManager) scheduleQueuedJobsWakeLocked(startedAt, deadline time.Time) {
+	if r.queuedJobsWakeTimer != nil {
+		r.queuedJobsWakeTimer.Stop()
+	}
+
+	r.queuedJobsWakeGeneration++
+	generation := r.queuedJobsWakeGeneration
+	r.queuedJobsWakeStartedAt = startedAt
+	r.queuedJobsWakeDeadline = deadline
+	r.queuedJobsWakeTimer = time.AfterFunc(time.Until(deadline), func() {
+		r.mux.Lock()
+		if generation != r.queuedJobsWakeGeneration || r.queuedJobsWakeTimer == nil {
+			r.mux.Unlock()
+			return
+		}
+		r.clearQueuedJobsWakeLocked()
+		r.mux.Unlock()
+
+		r.triggerQueuedJobs()
+	})
+}
+
+func (r *basePoolManager) clearQueuedJobsWakeLocked() {
+	r.queuedJobsWakeTimer = nil
+	r.queuedJobsWakeStartedAt = time.Time{}
+	r.queuedJobsWakeDeadline = time.Time{}
+}
+
+func (r *basePoolManager) stopQueuedJobsWakeLocked() {
+	if r.queuedJobsWakeTimer == nil {
+		return
+	}
+	r.queuedJobsWakeTimer.Stop()
+	r.queuedJobsWakeGeneration++
+	r.clearQueuedJobsWakeLocked()
+}
+
+func (r *basePoolManager) rescheduleQueuedJobsWakeLocked() bool {
+	if r.queuedJobsWakeTimer == nil {
+		return false
+	}
+
+	deadline := r.queuedJobsWakeStartedAt.Add(r.controllerInfo.JobBackoff())
+	if !deadline.After(time.Now()) {
+		r.stopQueuedJobsWakeLocked()
+		return true
+	}
+	if deadline.Equal(r.queuedJobsWakeDeadline) {
+		return false
+	}
+	r.scheduleQueuedJobsWakeLocked(r.queuedJobsWakeStartedAt, deadline)
+	return false
 }
 
 func jobIDFromLabels(labels []string) int64 {
@@ -586,7 +691,7 @@ func (r *basePoolManager) startLoopForFunction(
 	}()
 
 	for {
-		shouldRun := r.managerIsRunning
+		shouldRun := r.isRunning()
 		if alwaysRun {
 			shouldRun = true
 		}
@@ -1014,6 +1119,7 @@ func (r *basePoolManager) AddRunner(ctx context.Context, poolID string, aditiona
 	if err != nil {
 		return fmt.Errorf("error fetching pool: %w", err)
 	}
+	controllerInfo := r.controllerInfoSnapshot()
 
 	provider, ok := r.providers[pool.ProviderName]
 	if !ok {
@@ -1052,8 +1158,8 @@ func (r *basePoolManager) AddRunner(ctx context.Context, poolID string, aditiona
 		RunnerStatus:      params.RunnerPending,
 		OSArch:            pool.OSArch,
 		OSType:            pool.OSType,
-		CallbackURL:       r.controllerInfo.CallbackURL,
-		MetadataURL:       r.controllerInfo.MetadataURL,
+		CallbackURL:       controllerInfo.CallbackURL,
+		MetadataURL:       controllerInfo.MetadataURL,
 		CreateAttempt:     1,
 		GitHubRunnerGroup: pool.GitHubRunnerGroup,
 		AditionalLabels:   aditionalLabels,
@@ -1301,7 +1407,8 @@ func (r *basePoolManager) poolLabel(poolID string) string {
 }
 
 func (r *basePoolManager) controllerLabel() string {
-	return fmt.Sprintf("%s=%s", controllerLabelPrefix, r.controllerInfo.ControllerID.String())
+	controllerInfo := r.controllerInfoSnapshot()
+	return fmt.Sprintf("%s=%s", controllerLabelPrefix, controllerInfo.ControllerID.String())
 }
 
 func (r *basePoolManager) updateArgsFromProviderInstance(providerInstance commonParams.ProviderInstance) params.UpdateInstanceParams {
@@ -2015,13 +2122,16 @@ func (r *basePoolManager) Start() error {
 		go r.startLoopForFunction(r.ensureMinIdleRunners, common.PoolConsilitationInterval, "consolidate[ensure_min_idle]", false, nil)
 		go r.startLoopForFunction(r.retryFailedInstances, common.PoolConsilitationInterval, "consolidate[retry_failed]", false, nil)
 		go r.startLoopForFunction(r.updateTools, common.PoolToolUpdateInterval, "update_tools", true, nil)
-		go r.startLoopForFunction(r.consumeQueuedJobs, common.PoolConsilitationInterval, "job_queue_consumer", false, nil)
+		go r.startLoopForFunction(r.consumeQueuedJobs, common.PoolConsilitationInterval, "job_queue_consumer", false, r.queuedJobsTrigger)
 		go r.startLoopForFunction(r.reconcileStaleJobs, common.PoolStaleJobReconcileInterval, "stale_job_reconciler", false, nil)
 	}()
 	return nil
 }
 
 func (r *basePoolManager) Stop() error {
+	r.mux.Lock()
+	r.stopQueuedJobsWakeLocked()
+	r.mux.Unlock()
 	close(r.quit)
 	return nil
 }
@@ -2037,7 +2147,7 @@ func (r *basePoolManager) ID() string {
 // Delete runner will delete a runner from a pool. If forceRemove is set to true, any error received from
 // the IaaS provider will be ignored and deletion will continue.
 func (r *basePoolManager) DeleteRunner(runner params.Instance, forceRemove, bypassGHUnauthorizedError bool) error {
-	if !r.managerIsRunning && !bypassGHUnauthorizedError {
+	if !r.isRunning() && !bypassGHUnauthorizedError {
 		return runnerErrors.NewConflictError("pool manager is not running for %s", r.entity.String())
 	}
 
@@ -2208,6 +2318,8 @@ func (r *basePoolManager) consumeQueuedJobsWithLimiter(reservationLimiter *poolR
 		}
 	}()
 	queued := r.getQueuedJobs()
+	controllerInfo := r.controllerInfoSnapshot()
+	jobBackoff := controllerInfo.JobBackoff()
 
 	poolsCache := poolsForTags{
 		poolCacheType: r.entity.GetPoolBalancerType(),
@@ -2228,10 +2340,10 @@ func (r *basePoolManager) consumeQueuedJobsWithLimiter(reservationLimiter *poolR
 			continue
 		}
 
-		if time.Since(job.UpdatedAt) < r.controllerInfo.JobBackoff() {
+		if time.Since(job.UpdatedAt) < jobBackoff {
 			// give the idle runners a chance to pick up the job.
 			slog.DebugContext(
-				r.ctx, "job backoff not reached", "backoff_interval", r.controllerInfo.MinimumJobAgeBackoff,
+				r.ctx, "job backoff not reached", "backoff_interval", controllerInfo.MinimumJobAgeBackoff,
 				"job_id", job.WorkflowJobID)
 			continue
 		}

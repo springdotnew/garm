@@ -31,10 +31,14 @@ type entityGetter interface {
 
 func (r *basePoolManager) handleControllerUpdateEvent(controllerInfo params.ControllerInfo) {
 	r.mux.Lock()
-	defer r.mux.Unlock()
-
 	slog.DebugContext(r.ctx, "updating controller info", "controller_info", controllerInfo)
 	r.controllerInfo = controllerInfo
+	wakeQueuedJobs := r.rescheduleQueuedJobsWakeLocked()
+	r.mux.Unlock()
+
+	if wakeQueuedJobs {
+		r.triggerQueuedJobs()
+	}
 }
 
 func (r *basePoolManager) getClientOrStub() runnerCommon.GithubClient {
