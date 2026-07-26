@@ -35,6 +35,8 @@ import (
 	garmUtil "github.com/cloudbase/garm/util"
 )
 
+const scaleDownIdleGrace = 30 * time.Second
+
 func NewWorker(ctx context.Context, store dbCommon.Store, scaleSet params.ScaleSet, provider common.Provider) (*Worker, error) {
 	consumerID := fmt.Sprintf("scaleset-worker-%s-%d", scaleSet.Name, scaleSet.ID)
 	controllerInfo, err := store.ControllerInfo()
@@ -62,6 +64,7 @@ func NewWorker(ctx context.Context, store dbCommon.Store, scaleSet params.ScaleS
 		scaleSet:       scaleSet,
 		entity:         entity,
 		runners:        make(map[string]params.Instance),
+		autoScaleWake:  make(chan struct{}, 1),
 	}, nil
 }
 
@@ -78,7 +81,8 @@ type Worker struct {
 
 	consumer dbCommon.Consumer
 
-	listener *scaleSetListener
+	listener      *scaleSetListener
+	autoScaleWake chan struct{}
 
 	mux     sync.Mutex
 	running bool
@@ -656,6 +660,18 @@ func (w *Worker) handleScaleSetEvent(event dbCommon.ChangePayload) {
 	case dbCommon.UpdateOperation:
 		slog.DebugContext(w.ctx, "got update operation")
 		w.mux.Lock()
+		if scaleSet.UpdatedAt.Before(w.scaleSet.UpdatedAt) {
+			currentUpdatedAt := w.scaleSet.UpdatedAt
+			w.mux.Unlock()
+			slog.DebugContext(
+				w.ctx,
+				"ignoring stale scale set update",
+				"current_updated_at", currentUpdatedAt,
+				"event_updated_at", scaleSet.UpdatedAt,
+			)
+			return
+		}
+		previousTarget := w.targetRunners()
 
 		if scaleSet.MaxRunners < w.scaleSet.MaxRunners || !scaleSet.Enabled {
 			// we stop the listener if the scale set is disabled or if the max runners
@@ -670,7 +686,11 @@ func (w *Worker) handleScaleSetEvent(event dbCommon.ChangePayload) {
 			}
 		}
 		w.scaleSet = scaleSet
+		targetIncreased := w.targetRunners() > previousTarget
 		w.mux.Unlock()
+		if targetIncreased {
+			w.signalAutoScale()
+		}
 	default:
 		slog.DebugContext(w.ctx, "invalid operation type; ignoring", "operation_type", event.Operation)
 	}
@@ -729,7 +749,7 @@ func (w *Worker) handleEvent(event dbCommon.ChangePayload) {
 		w.handleScaleSetEvent(event)
 	case dbCommon.InstanceEntityType:
 		slog.DebugContext(w.ctx, "got instance event")
-		w.handleInstanceEntityEvent(event)
+		go w.handleInstanceEntityEvent(event)
 	default:
 		slog.DebugContext(w.ctx, "invalid entity type; ignoring", "entity_type", event.EntityType)
 	}
@@ -747,7 +767,7 @@ func (w *Worker) loop() {
 				slog.InfoContext(w.ctx, "consumer channel closed")
 				return
 			}
-			go w.handleEvent(event)
+			w.handleEvent(event)
 		case <-w.ctx.Done():
 			slog.DebugContext(w.ctx, "context done")
 			return
@@ -948,9 +968,8 @@ func (w *Worker) handleScaleDown() {
 		}
 		switch runner.Status {
 		case commonParams.InstanceRunning:
-			switch runner.RunnerStatus {
-			case params.RunnerTerminated, params.RunnerActive:
-				slog.DebugContext(w.ctx, "runner is not in a valid state; skipping", "runner_name", runner.Name, "runner_status", runner.RunnerStatus)
+			if !runnerCanScaleDown(runner, time.Now()) {
+				slog.DebugContext(w.ctx, "runner is not ready for scale down; skipping", "runner_name", runner.Name, "runner_status", runner.RunnerStatus)
 				continue
 			}
 			locked := locking.TryLock(runner.Name, w.consumerID)
@@ -1005,13 +1024,19 @@ func (w *Worker) handleScaleDown() {
 			removed++
 		case commonParams.InstancePendingDelete, commonParams.InstancePendingForceDelete,
 			commonParams.InstanceDeleting, commonParams.InstanceDeleted:
-			removed++
 			continue
 		default:
 			slog.WarnContext(w.ctx, "runner is not in a valid state; skipping", "runner_name", runner.Name, "runner_status", runner.Status)
 			continue
 		}
 	}
+}
+
+func runnerCanScaleDown(runner params.Instance, now time.Time) bool {
+	if runner.Status != commonParams.InstanceRunning || runner.RunnerStatus != params.RunnerIdle {
+		return false
+	}
+	return runner.UpdatedAt.IsZero() || !now.Before(runner.UpdatedAt.Add(scaleDownIdleGrace))
 }
 
 func (w *Worker) targetRunners() int {
@@ -1025,7 +1050,27 @@ func (w *Worker) targetRunners() int {
 }
 
 func (w *Worker) runnerCount() int {
-	return len(w.runners)
+	// Terminated and deleting runners cannot serve the desired jobs. Active
+	// runners still count because GitHub's TotalAssignedJobs includes running
+	// jobs; excluding them causes a replacement to be created for every start.
+	count := 0
+	for _, runner := range w.runners {
+		if garmErrors.InstanceIsBeingDeleted(runner.Status) {
+			continue
+		}
+		if runner.RunnerStatus == params.RunnerTerminated {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func (w *Worker) signalAutoScale() {
+	select {
+	case w.autoScaleWake <- struct{}{}:
+	default:
+	}
 }
 
 func (w *Worker) handleAutoScale() {
@@ -1058,27 +1103,29 @@ func (w *Worker) handleAutoScale() {
 		case <-w.ctx.Done():
 			return
 		case <-ticker.C:
-			w.mux.Lock()
-			for _, instance := range w.runners {
-				if err := w.handleInstanceCleanup(instance); err != nil {
-					slog.ErrorContext(w.ctx, "error cleaning up instance", "instance_id", instance.ID, "error", err)
-				}
-			}
-
-			if w.runnerCount() == w.targetRunners() {
-				lastMsgDebugLog("desired runner count reached", w.targetRunners(), w.runnerCount())
-				w.mux.Unlock()
-				continue
-			}
-
-			if w.runnerCount() < w.targetRunners() {
-				lastMsgDebugLog("scaling up", w.targetRunners(), w.runnerCount())
-				w.handleScaleUp()
-			} else {
-				lastMsgDebugLog("attempting to scale down", w.targetRunners(), w.runnerCount())
-				w.handleScaleDown()
-			}
-			w.mux.Unlock()
+		case <-w.autoScaleWake:
 		}
+
+		w.mux.Lock()
+		for _, instance := range w.runners {
+			if err := w.handleInstanceCleanup(instance); err != nil {
+				slog.ErrorContext(w.ctx, "error cleaning up instance", "instance_id", instance.ID, "error", err)
+			}
+		}
+
+		if w.runnerCount() == w.targetRunners() {
+			lastMsgDebugLog("desired runner count reached", w.targetRunners(), w.runnerCount())
+			w.mux.Unlock()
+			continue
+		}
+
+		if w.runnerCount() < w.targetRunners() {
+			lastMsgDebugLog("scaling up", w.targetRunners(), w.runnerCount())
+			w.handleScaleUp()
+		} else {
+			lastMsgDebugLog("attempting to scale down", w.targetRunners(), w.runnerCount())
+			w.handleScaleDown()
+		}
+		w.mux.Unlock()
 	}
 }

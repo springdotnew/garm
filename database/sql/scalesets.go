@@ -497,7 +497,7 @@ func (s *sqlDatabase) SetScaleSetLastMessageID(_ context.Context, scaleSetID uin
 		if err != nil {
 			return fmt.Errorf("error fetching scale set: %w", err)
 		}
-		result := tx.Model(&dbSet).Updates(map[string]interface{}{
+		result := tx.Model(&dbSet).Omit(clause.Associations).Updates(map[string]interface{}{
 			"last_message_id": lastMessageID,
 		})
 		if result.Error != nil {
@@ -534,7 +534,7 @@ func (s *sqlDatabase) SetScaleSetDesiredRunnerCount(_ context.Context, scaleSetI
 		if err != nil {
 			return fmt.Errorf("error fetching scale set: %w", err)
 		}
-		result := tx.Model(&dbSet).Updates(map[string]interface{}{
+		result := tx.Model(&dbSet).Omit(clause.Associations).Updates(map[string]interface{}{
 			"desired_runner_count": desiredRunnerCount,
 		})
 		if result.Error != nil {
