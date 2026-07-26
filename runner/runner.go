@@ -1098,6 +1098,14 @@ func (r *Runner) AddInstanceStatusMessage(ctx context.Context, param params.Inst
 	if instanceName == "" {
 		return runnerErrors.ErrUnauthorized
 	}
+	if stage := knownBootstrapStage(param.Message); stage != "" {
+		slog.InfoContext(
+			ctx,
+			"runner bootstrap stage",
+			"runner_name", instanceName,
+			"stage", stage,
+		)
+	}
 
 	if err := r.store.AddInstanceEvent(ctx, instanceName, params.StatusEvent, params.EventInfo, param.Message); err != nil {
 		return fmt.Errorf("error adding status update: %w", err)
@@ -1122,6 +1130,33 @@ func (r *Runner) AddInstanceStatusMessage(ctx context.Context, param params.Inst
 	}
 
 	return nil
+}
+
+func knownBootstrapStage(message string) string {
+	switch {
+	case strings.HasPrefix(message, "using cached runner found"):
+		return "cached-runner"
+	case message == "configuring runner":
+		return "configuring"
+	case message == "downloading JIT credentials":
+		return "jit-credentials"
+	case message == "generating systemd unit file":
+		return "systemd-unit"
+	case message == "enabling runner service":
+		return "systemd-enable"
+	case message == "runner service started":
+		return "service-started"
+	case message == "runner listener connect retry":
+		return "listener-connect-retry"
+	case message == "runner listener ready":
+		return "listener-ready"
+	case message == "runner listener readiness timeout":
+		return "listener-ready-timeout"
+	case message == "runner successfully installed":
+		return "installed"
+	default:
+		return ""
+	}
 }
 
 func (r *Runner) UpdateSystemInfo(ctx context.Context, param params.UpdateSystemInfoParams) error {

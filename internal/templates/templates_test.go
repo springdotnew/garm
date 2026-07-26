@@ -50,6 +50,9 @@ func TestWrapperRendersProxySettings(t *testing.T) {
 					t.Errorf("expected %q to be absent when no proxy is set", needle)
 				}
 			}
+			if osType == commonParams.Linux && strings.Contains(string(rendered), "set -x") {
+				t.Error("linux wrapper must not trace the callback bearer token")
+			}
 
 			rendered, err = RenderRunnerInstallWrapper(ctx, osType, "https://garm.example.com/api/v1/metadata", "https://garm.example.com/api/v1/callbacks", "token", proxyCfg)
 			if err != nil {
