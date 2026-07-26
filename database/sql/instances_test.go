@@ -29,6 +29,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
+	runnerErrors "github.com/cloudbase/garm-provider-common/errors"
 	commonParams "github.com/cloudbase/garm-provider-common/params"
 	dbCommon "github.com/cloudbase/garm/database/common"
 	"github.com/cloudbase/garm/database/watcher"
@@ -593,6 +594,47 @@ func (s *InstancesTestSuite) TestUpdateInstance() {
 	s.Require().Equal(s.Fixtures.UpdateInstanceParams.RunnerStatus, instance.RunnerStatus)
 	s.Require().Equal(s.Fixtures.UpdateInstanceParams.AgentID, instance.AgentID)
 	s.Require().Equal(s.Fixtures.UpdateInstanceParams.CreateAttempt, instance.CreateAttempt)
+}
+
+func (s *InstancesTestSuite) TestDeletingInstanceCanReturnToPendingDelete() {
+	instanceName := s.Fixtures.Instances[0].Name
+	for _, status := range []commonParams.InstanceStatus{
+		commonParams.InstancePendingDelete,
+		commonParams.InstanceDeleting,
+		commonParams.InstancePendingDelete,
+	} {
+		instance, err := s.Store.UpdateInstance(s.adminCtx, instanceName, params.UpdateInstanceParams{Status: status})
+		s.Require().NoError(err)
+		s.Require().Equal(status, instance.Status)
+	}
+}
+
+func (s *InstancesTestSuite) TestPendingDeleteRetryCannotOverwriteForceDelete() {
+	instanceName := s.Fixtures.Instances[0].Name
+	for _, status := range []commonParams.InstanceStatus{
+		commonParams.InstancePendingDelete,
+		commonParams.InstanceDeleting,
+	} {
+		_, err := s.Store.UpdateInstance(s.adminCtx, instanceName, params.UpdateInstanceParams{Status: status})
+		s.Require().NoError(err)
+	}
+
+	_, err := s.Store.ForceUpdateInstance(s.adminCtx, instanceName, params.UpdateInstanceParams{
+		Status: commonParams.InstancePendingForceDelete,
+	})
+	s.Require().NoError(err)
+
+	_, err = s.Store.UpdateInstance(s.adminCtx, instanceName, params.UpdateInstanceParams{
+		Status: commonParams.InstancePendingDelete,
+	})
+	var transitionErr *runnerErrors.InstanceTransitionError
+	s.Require().ErrorAs(err, &transitionErr)
+	s.Require().Equal(commonParams.InstancePendingForceDelete, transitionErr.From)
+	s.Require().Equal(commonParams.InstancePendingDelete, transitionErr.To)
+
+	instance, err := s.Store.GetInstance(s.adminCtx, instanceName)
+	s.Require().NoError(err)
+	s.Require().Equal(commonParams.InstancePendingForceDelete, instance.Status)
 }
 
 func (s *InstancesTestSuite) TestUpdateInstanceDBUpdateInstanceErr() {

@@ -251,6 +251,7 @@ var InstanceStatusTransitions = map[commonParams.InstanceStatus][]commonParams.I
 	commonParams.InstanceDeleting: {
 		commonParams.InstanceError,
 		commonParams.InstanceDeleted,
+		commonParams.InstancePendingDelete,
 	},
 	commonParams.InstanceDeleted: {}, // no further transitions possible
 	commonParams.InstancePendingCreate: {
@@ -261,6 +262,7 @@ var InstanceStatusTransitions = map[commonParams.InstanceStatus][]commonParams.I
 	commonParams.InstanceCreating: {
 		commonParams.InstanceError,
 		commonParams.InstanceRunning,
+		commonParams.InstancePendingDelete,
 	},
 	commonParams.InstanceStatusUnknown: {
 		commonParams.InstanceRunning,
