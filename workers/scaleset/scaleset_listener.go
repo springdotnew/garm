@@ -37,9 +37,10 @@ func newListener(ctx context.Context, scaleSetHelper scaleSetHelper) *scaleSetLi
 		slog.Any("sub_worker", "scaleset-listener"),
 	)
 	return &scaleSetListener{
-		ctx:            ctx,
-		scaleSetHelper: scaleSetHelper,
-		lastMessageID:  scaleSetHelper.GetScaleSet().LastMessageID,
+		ctx:             ctx,
+		scaleSetHelper:  scaleSetHelper,
+		lastMessageID:   scaleSetHelper.GetScaleSet().LastMessageID,
+		outstandingJobs: make(map[string]struct{}),
 	}
 }
 
@@ -55,8 +56,9 @@ type scaleSetListener struct {
 	cancelFunc    context.CancelFunc
 	lastMessageID int64
 
-	scaleSetHelper scaleSetHelper
-	messageSession *scalesets.MessageSession
+	scaleSetHelper  scaleSetHelper
+	messageSession  *scalesets.MessageSession
+	outstandingJobs map[string]struct{}
 
 	mux        sync.Mutex
 	running    atomic.Bool
@@ -228,13 +230,46 @@ func (l *scaleSetListener) handleSessionMessage(msg params.RunnerScaleSetMessage
 		l.lastMessageID = msg.MessageID
 	}
 
-	if err := l.scaleSetHelper.SetDesiredRunnerCount(msg.Statistics.TotalAssignedJobs); err != nil {
+	desiredRunnerCount := l.updateOutstandingJobs(
+		msg.Statistics.TotalAssignedJobs,
+		assignedJobs,
+		startedJobs,
+		completedJobs,
+	)
+	if err := l.scaleSetHelper.SetDesiredRunnerCount(desiredRunnerCount); err != nil {
 		slog.ErrorContext(l.ctx, "setting desired runner count", "error", err)
 	}
 
 	if err := l.messageSession.DeleteMessage(l.listenerCtx, msg.MessageID); err != nil {
 		slog.ErrorContext(l.ctx, "deleting message", "error", err)
 	}
+}
+
+func (l *scaleSetListener) updateOutstandingJobs(
+	reportedCount int,
+	assignedJobs, startedJobs, completedJobs []params.ScaleSetJobMessage,
+) int {
+	for _, job := range assignedJobs {
+		l.outstandingJobs[job.JobID] = struct{}{}
+	}
+	for _, job := range startedJobs {
+		l.outstandingJobs[job.JobID] = struct{}{}
+	}
+	for _, job := range completedJobs {
+		delete(l.outstandingJobs, job.JobID)
+	}
+
+	observedCount := len(l.outstandingJobs)
+	if observedCount > reportedCount {
+		slog.InfoContext(
+			l.ctx,
+			"raising desired runner count to observed outstanding jobs",
+			"reported_count", reportedCount,
+			"observed_count", observedCount,
+		)
+		return observedCount
+	}
+	return reportedCount
 }
 
 func (l *scaleSetListener) loop() {
