@@ -1368,6 +1368,8 @@ func (r *basePoolManager) paramsWorkflowJobToParamsJob(job params.WorkflowJob) (
 		WorkflowJobID:   job.WorkflowJob.ID,
 		Action:          job.Action,
 		RunID:           job.WorkflowJob.RunID,
+		RunAttempt:      job.WorkflowJob.RunAttempt,
+		WorkflowName:    job.WorkflowJob.WorkflowName,
 		Status:          job.WorkflowJob.Status,
 		Conclusion:      job.WorkflowJob.Conclusion,
 		StartedAt:       job.WorkflowJob.StartedAt,

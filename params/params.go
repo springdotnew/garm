@@ -430,6 +430,23 @@ type Instance struct {
 	// need to.
 	Generation uint64 `json:"generation"`
 
+	// Speculative marks a runner created from a prewarm forecast rather than
+	// from a job GitHub had actually queued.
+	Speculative bool `json:"speculative,omitempty"`
+
+	// SpeculativeRequestID links a speculative runner back to the forecast
+	// that created it.
+	SpeculativeRequestID string `json:"speculative_request_id,omitempty"`
+
+	// SpeculativeExpiresAt is when an unclaimed speculative runner becomes
+	// eligible for reaping.
+	SpeculativeExpiresAt *time.Time `json:"speculative_expires_at,omitempty"`
+
+	// ReservedForWorkflowJobID is the workflow job that claimed this
+	// speculative runner. A runner with this set is real work and is never
+	// reaped as speculative surplus.
+	ReservedForWorkflowJobID *int64 `json:"reserved_for_workflow_job_id,omitempty"`
+
 	// Do not serialize sensitive info.
 	CallbackURL      string            `json:"-"`
 	MetadataURL      string            `json:"-"`
@@ -1422,6 +1439,10 @@ type Job struct {
 	ScaleSetJobID string `json:"scaleset_job_id,omitempty"`
 	// RunID is the ID of the workflow run. A run may have multiple jobs.
 	RunID int64 `json:"run_id,omitempty"`
+	// RunAttempt is the attempt number of the workflow run this job belongs to.
+	RunAttempt int64 `json:"run_attempt,omitempty"`
+	// WorkflowName is the name of the workflow the job belongs to.
+	WorkflowName string `json:"workflow_name,omitempty"`
 	// Action is the specific activity that triggered the event.
 	Action string `json:"action,omitempty"`
 	// Conclusion is the outcome of the job.

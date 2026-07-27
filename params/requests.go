@@ -236,6 +236,14 @@ type CreateInstanceParams struct {
 	AditionalLabels   []string          `json:"aditional_labels,omitempty"`
 	JitConfiguration  map[string]string `json:"jit_configuration,omitempty"`
 	Generation        uint64            `json:"generation"`
+
+	// Speculative marks the instance as created from a prewarm forecast.
+	Speculative bool `json:"-"`
+	// SpeculativeRequestID links the instance to the forecast that created it.
+	SpeculativeRequestID string `json:"-"`
+	// SpeculativeExpiresAt is when the instance becomes reapable if it is
+	// never claimed by a real job.
+	SpeculativeExpiresAt *time.Time `json:"-"`
 }
 
 // swagger:model CreatePoolParams

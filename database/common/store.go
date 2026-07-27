@@ -220,6 +220,33 @@ type FileObjectStore interface {
 	OpenFileObjectContent(ctx context.Context, objID uint) (io.ReadCloser, error)
 }
 
+// PrewarmStore backs speculative prewarming: the forecast that a workflow
+// run's gate job is about to unblock a known fanout, and the bookkeeping that
+// keeps a forecast from ever outranking real queued work.
+type PrewarmStore interface {
+	// CreatePrewarmRequest inserts a matched rule, deduplicated on the run and
+	// rule. The boolean reports whether this call created the request; a
+	// duplicate webhook delivery gets false and the existing cohort.
+	CreatePrewarmRequest(ctx context.Context, param params.CreatePrewarmRequestParams) (params.PrewarmRequest, bool, error)
+	ListActivePrewarmRequests(ctx context.Context, entityID string) ([]params.PrewarmRequest, error)
+	// ConsumePrewarmForecast records one unit of real queued demand against a
+	// run's forecast for a label set.
+	ConsumePrewarmForecast(ctx context.Context, entityID string, runID, runAttempt int64, labelKey string) error
+	// ClaimSpeculativeInstance atomically reserves one unclaimed speculative
+	// runner for a workflow job. Returns ErrNotFound when there is none.
+	ClaimSpeculativeInstance(ctx context.Context, poolIDs []string, workflowJobID int64) (params.Instance, error)
+	CountSpeculativeInstances(ctx context.Context) (int64, error)
+	CountPoolAvailableCapacity(ctx context.Context, poolID string) (int64, error)
+	RecordPrewarmInstancesCreated(ctx context.Context, requestID, labelKey string, count uint) error
+	RecordPrewarmInstancesReaped(ctx context.Context, requestID, labelKey string, count uint) error
+	RecordPrewarmInstanceClaimed(ctx context.Context, requestID, labelKey string) error
+	ExpirePrewarmRequests(ctx context.Context, now time.Time) (int64, error)
+	// ListReapableSpeculativeInstances returns only expired, unclaimed,
+	// non-active speculative runners. Claimed or busy runners are excluded by
+	// the query itself, not by the caller.
+	ListReapableSpeculativeInstances(ctx context.Context, now time.Time) ([]params.Instance, error)
+}
+
 //go:generate go run github.com/vektra/mockery/v2@latest
 type Store interface {
 	RepoStore
@@ -241,6 +268,7 @@ type Store interface {
 	TemplateStore
 	ProxyStore
 	FileObjectStore
+	PrewarmStore
 
 	ControllerInfo() (params.ControllerInfo, error)
 	InitController() (params.ControllerInfo, error)
