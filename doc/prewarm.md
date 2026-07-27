@@ -115,6 +115,14 @@ speculative runner exists, GARM hands it to that job instead of creating a
 second one. The claim is a single conditional update, so two jobs racing for the
 last speculative runner can never both win.
 
+**A forecast that is over reads as over.** The window is enforced against the
+clock on every pass, not on the reaper's schedule, so an expired forecast stops
+buying machines the moment it expires rather than the next time the reaper
+happens to run. `garm_prewarm_target_runners` follows it down to zero when the
+window closes, when the request is reaped, and when prewarming is paused — a
+gauge you size a rule from is only useful if it also tells you when there is
+nothing left to serve.
+
 **Nothing that is working is ever removed.** Idle scale-down skips speculative
 runners while their window is open. The prewarm reaper removes only runners that
 are speculative, unclaimed, past their expiry, and not active — the database
@@ -208,7 +216,8 @@ garm-cli controller update --prewarm-paused
 This takes effect on the next reconcile — no restart, no configuration change.
 Rules stay exactly as configured, and scaling for real queued jobs is
 completely unaffected. Runners already in flight are still drained, so pausing
-never strands capacity. Undo it with `--prewarm-paused=false`.
+never strands capacity. `garm_prewarm_target_runners` drops to zero on the same
+pass, which is how you confirm it took. Undo it with `--prewarm-paused=false`.
 
 `garm-cli controller show` reports the current state.
 
