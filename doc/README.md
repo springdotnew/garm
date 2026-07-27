@@ -30,6 +30,7 @@ Get GARM running and create your first runner pool:
 | [Providers](providers.md) | Supported providers and configuration |
 | [Monitoring and Debugging](monitoring.md) | Metrics, log streaming, events, and the `top` dashboard |
 | [Performance](performance.md) | Cached runners, image optimization, LXD tuning |
+| [Speculative Prewarming](prewarm.md) | Create runners for a PR fanout while its gate job is still running |
 | [Webhooks](webhooks.md) | Automatic and manual webhook setup |
 | [Building from Source](building-from-source.md) | Compiling GARM, the Web UI, and regenerating API clients |
 | [FAQ](faq.md) | Common questions and answers |
