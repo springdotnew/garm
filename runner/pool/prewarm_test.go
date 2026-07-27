@@ -385,12 +385,12 @@ func (s *PrewarmPoolTestSuite) TestDisabledPrewarmIsANoOp() {
 	s.Empty(s.allInstances())
 }
 
-// Every controller in the fleet runs this code with the feature switched off.
-// The reap loop's first act is a write, so leaving it up on a controller that
-// never turns prewarming on would be a periodic database write forever on
-// behalf of runners that cannot exist.
-func (s *PrewarmPoolTestSuite) TestDisabledPrewarmStartsNoReapLoop() {
-	s.mgr.prewarmCfg = config.Prewarm{}
+// startSpeculativeReaperOrFail runs the reaper entry point and fails the test if
+// it does not return. With prewarming disabled it must drain and stop; anything
+// that keeps ticking would hang here for the reap interval instead of reporting
+// the defect, which is the opposite of what this suite is for.
+func (s *PrewarmPoolTestSuite) startSpeculativeReaperOrFail() {
+	s.T().Helper()
 
 	returned := make(chan struct{})
 	go func() {
@@ -401,8 +401,18 @@ func (s *PrewarmPoolTestSuite) TestDisabledPrewarmStartsNoReapLoop() {
 	select {
 	case <-returned:
 	case <-time.After(10 * time.Second):
-		s.Fail("startSpeculativeReaper did not return with prewarming disabled; it started a loop")
+		s.FailNow("startSpeculativeReaper did not return with prewarming disabled; it is looping")
 	}
+}
+
+// Every controller in the fleet runs this code with the feature switched off.
+// The reap loop's first act is a write, so leaving it up on a controller that
+// never turns prewarming on would be a periodic database write forever on
+// behalf of runners that cannot exist.
+func (s *PrewarmPoolTestSuite) TestDisabledPrewarmStartsNoReapLoop() {
+	s.mgr.prewarmCfg = config.Prewarm{}
+
+	s.startSpeculativeReaperOrFail()
 }
 
 // The other half of that trade: a controller whose configuration turned
@@ -418,11 +428,35 @@ func (s *PrewarmPoolTestSuite) TestDisablingPrewarmDrainsTheRunnersItLeftBehind(
 	}
 
 	s.mgr.prewarmCfg = config.Prewarm{}
-	s.mgr.startSpeculativeReaper()
+	s.startSpeculativeReaperOrFail()
 
 	speculative := s.speculativeInstances()
 	s.Require().Len(speculative, prewarmTestCohortLen)
 	for _, instance := range speculative {
+		s.Equal(commonParams.InstancePendingDelete, instance.Status)
+	}
+}
+
+// A drain that could not remove a runner must say so and try again rather than
+// return and leave it billing. The pool manager not being running yet is the
+// real case: removal is refused until the entity's first tools update lands.
+func (s *PrewarmPoolTestSuite) TestDrainReportsRunnersItCouldNotReclaim() {
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+	s.Require().Len(s.speculativeInstances(), prewarmTestCohortLen)
+
+	s.mgr.prewarmCfg = config.Prewarm{}
+	s.mgr.SetPoolRunningState(false, "not running yet")
+
+	stranded, err := s.mgr.drainSpeculativeSurplus()
+	s.Require().NoError(err)
+	s.Equal(prewarmTestCohortLen, stranded, "a runner that could not be removed is not drained")
+
+	s.mgr.SetPoolRunningState(true, "")
+	stranded, err = s.mgr.drainSpeculativeSurplus()
+	s.Require().NoError(err)
+	s.Zero(stranded, "the retry reclaims what the first sweep could not")
+	for _, instance := range s.speculativeInstances() {
 		s.Equal(commonParams.InstancePendingDelete, instance.Status)
 	}
 }
