@@ -127,4 +127,7 @@ type PrewarmDemand struct {
 	// RequestIDs are the requests that contributed to Remaining, most recent
 	// first. New capacity is attributed to the first one.
 	RequestIDs []string
+	// ExpiresAt is the latest expiry among the contributing requests. Capacity
+	// is shared, so it must outlive every forecast that still wants it.
+	ExpiresAt time.Time
 }

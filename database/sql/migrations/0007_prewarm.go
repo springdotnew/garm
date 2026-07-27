@@ -82,8 +82,9 @@ type instance0007 struct {
 func (instance0007) TableName() string { return "instances" }
 
 type workflowJob0007 struct {
-	RunAttempt   int64
-	WorkflowName string `gorm:"index:idx_workflow_jobs_workflow_name"`
+	RunAttempt      int64
+	WorkflowName    string `gorm:"index:idx_workflow_jobs_workflow_name"`
+	PrewarmConsumed bool
 }
 
 func (workflowJob0007) TableName() string { return "workflow_jobs" }

@@ -503,6 +503,10 @@ type WorkflowJob struct {
 	// rules match on it, so it must survive a controller restart alongside the
 	// job itself.
 	WorkflowName string `gorm:"index:idx_workflow_jobs_workflow_name"`
+	// PrewarmConsumed records that this job has already taken its unit of the
+	// prewarm forecast. GitHub delivers a webhook more than once often enough
+	// that without it, a redelivery would quietly shrink the forecast.
+	PrewarmConsumed bool
 	// Action is the specific activity that triggered the event.
 	Action string `gorm:"type:varchar(254);index"`
 	// Conclusion is the outcome of the job.

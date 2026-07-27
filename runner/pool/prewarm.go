@@ -51,7 +51,8 @@ func (r *basePoolManager) handlePrewarmForQueuedJob(ctx context.Context, job par
 	}
 
 	labelKey := config.NormalizeLabelKey(job.Labels)
-	if err := r.store.ConsumePrewarmForecast(ctx, r.entity.ID, job.RunID, job.RunAttempt, labelKey); err != nil {
+	if err := r.store.ConsumePrewarmForecast(
+		ctx, r.entity.ID, job.WorkflowJobID, job.RunID, job.RunAttempt, labelKey); err != nil {
 		slog.With(slog.Any("error", err)).ErrorContext(
 			ctx, "failed to consume prewarm forecast",
 			"job_id", job.WorkflowJobID,
@@ -224,6 +225,9 @@ func aggregatePrewarmDemand(requests []params.PrewarmRequest) []params.PrewarmDe
 			}
 			existing.Remaining += remaining
 			existing.RequestIDs = append(existing.RequestIDs, request.ID)
+			if request.ExpiresAt.After(existing.ExpiresAt) {
+				existing.ExpiresAt = request.ExpiresAt
+			}
 		}
 	}
 
@@ -264,10 +268,10 @@ func (r *basePoolManager) reconcilePrewarmTarget(demand params.PrewarmDemand) er
 	}
 
 	// Capacity is pooled across every request that wants this label set, so it
-	// cannot be attributed to one of them. Accounting follows the oldest
-	// request, which is the one whose window closes first.
+	// cannot be attributed to one of them. Accounting follows the most recent
+	// request, which is the one that grew the forecast we are acting on.
 	requestID := demand.RequestIDs[0]
-	created := r.createSpeculativeRunners(pool, requestID, demand.LabelKey, deficit)
+	created := r.createSpeculativeRunners(pool, requestID, demand, deficit)
 	if created == 0 {
 		return nil
 	}
@@ -353,18 +357,21 @@ func (r *basePoolManager) capSpeculativeDeficit(deficit int64, labelKey, poolID 
 // how many were actually created. Provider capacity and quota errors shrink the
 // cohort; they are never fatal, because a smaller forecast still helps and the
 // real queued-job path remains the safety net.
-func (r *basePoolManager) createSpeculativeRunners(pool params.Pool, requestID, labelKey string, count int64) int64 {
-	expiresAt := time.Now().Add(r.prewarmCfg.TTL())
+func (r *basePoolManager) createSpeculativeRunners(pool params.Pool, requestID string, demand params.PrewarmDemand, count int64) int64 {
+	// A runner outlives every forecast that wants it, so its expiry is the
+	// window of the longest-lived request — not a fresh TTL, which would let
+	// capacity drift past the runs that justified it.
 	speculative := &params.SpeculativeInstanceParams{
 		RequestID: requestID,
-		ExpiresAt: expiresAt,
+		ExpiresAt: demand.ExpiresAt,
 	}
 
 	slog.InfoContext(
 		r.ctx, "prewarming runners",
 		"request_id", requestID,
-		"label_key", labelKey,
+		"label_key", demand.LabelKey,
 		"pool_id", pool.ID,
+		"expires_at", demand.ExpiresAt,
 		"count", count)
 
 	limiter := newPoolReservationLimiter()
@@ -377,7 +384,7 @@ func (r *basePoolManager) createSpeculativeRunners(pool params.Pool, requestID, 
 				slog.InfoContext(
 					r.ctx, "pool is full; prewarm cohort trimmed",
 					"pool_id", pool.ID,
-					"label_key", labelKey,
+					"label_key", demand.LabelKey,
 					"created", created,
 					"requested", count)
 				break
@@ -385,7 +392,7 @@ func (r *basePoolManager) createSpeculativeRunners(pool params.Pool, requestID, 
 			slog.With(slog.Any("error", err)).ErrorContext(
 				r.ctx, "failed to create speculative runner",
 				"pool_id", pool.ID,
-				"label_key", labelKey)
+				"label_key", demand.LabelKey)
 			continue
 		}
 		created++

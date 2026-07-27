@@ -231,7 +231,7 @@ type PrewarmStore interface {
 	ListActivePrewarmRequests(ctx context.Context, entityID string) ([]params.PrewarmRequest, error)
 	// ConsumePrewarmForecast records one unit of real queued demand against a
 	// run's forecast for a label set.
-	ConsumePrewarmForecast(ctx context.Context, entityID string, runID, runAttempt int64, labelKey string) error
+	ConsumePrewarmForecast(ctx context.Context, entityID string, workflowJobID, runID, runAttempt int64, labelKey string) error
 	// ClaimSpeculativeInstance atomically reserves one unclaimed speculative
 	// runner for a workflow job. Returns ErrNotFound when there is none.
 	ClaimSpeculativeInstance(ctx context.Context, poolIDs []string, workflowJobID int64) (params.Instance, error)

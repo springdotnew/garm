@@ -231,17 +231,17 @@ func (_c *Store_ClaimSpeculativeInstance_Call) RunAndReturn(run func(context.Con
 	return _c
 }
 
-// ConsumePrewarmForecast provides a mock function with given fields: ctx, entityID, runID, runAttempt, labelKey
-func (_m *Store) ConsumePrewarmForecast(ctx context.Context, entityID string, runID int64, runAttempt int64, labelKey string) error {
-	ret := _m.Called(ctx, entityID, runID, runAttempt, labelKey)
+// ConsumePrewarmForecast provides a mock function with given fields: ctx, entityID, workflowJobID, runID, runAttempt, labelKey
+func (_m *Store) ConsumePrewarmForecast(ctx context.Context, entityID string, workflowJobID int64, runID int64, runAttempt int64, labelKey string) error {
+	ret := _m.Called(ctx, entityID, workflowJobID, runID, runAttempt, labelKey)
 
 	if len(ret) == 0 {
 		panic("no return value specified for ConsumePrewarmForecast")
 	}
 
 	var r0 error
-	if rf, ok := ret.Get(0).(func(context.Context, string, int64, int64, string) error); ok {
-		r0 = rf(ctx, entityID, runID, runAttempt, labelKey)
+	if rf, ok := ret.Get(0).(func(context.Context, string, int64, int64, int64, string) error); ok {
+		r0 = rf(ctx, entityID, workflowJobID, runID, runAttempt, labelKey)
 	} else {
 		r0 = ret.Error(0)
 	}
@@ -257,16 +257,17 @@ type Store_ConsumePrewarmForecast_Call struct {
 // ConsumePrewarmForecast is a helper method to define mock.On call
 //   - ctx context.Context
 //   - entityID string
+//   - workflowJobID int64
 //   - runID int64
 //   - runAttempt int64
 //   - labelKey string
-func (_e *Store_Expecter) ConsumePrewarmForecast(ctx interface{}, entityID interface{}, runID interface{}, runAttempt interface{}, labelKey interface{}) *Store_ConsumePrewarmForecast_Call {
-	return &Store_ConsumePrewarmForecast_Call{Call: _e.mock.On("ConsumePrewarmForecast", ctx, entityID, runID, runAttempt, labelKey)}
+func (_e *Store_Expecter) ConsumePrewarmForecast(ctx interface{}, entityID interface{}, workflowJobID interface{}, runID interface{}, runAttempt interface{}, labelKey interface{}) *Store_ConsumePrewarmForecast_Call {
+	return &Store_ConsumePrewarmForecast_Call{Call: _e.mock.On("ConsumePrewarmForecast", ctx, entityID, workflowJobID, runID, runAttempt, labelKey)}
 }
 
-func (_c *Store_ConsumePrewarmForecast_Call) Run(run func(ctx context.Context, entityID string, runID int64, runAttempt int64, labelKey string)) *Store_ConsumePrewarmForecast_Call {
+func (_c *Store_ConsumePrewarmForecast_Call) Run(run func(ctx context.Context, entityID string, workflowJobID int64, runID int64, runAttempt int64, labelKey string)) *Store_ConsumePrewarmForecast_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].(context.Context), args[1].(string), args[2].(int64), args[3].(int64), args[4].(string))
+		run(args[0].(context.Context), args[1].(string), args[2].(int64), args[3].(int64), args[4].(int64), args[5].(string))
 	})
 	return _c
 }
@@ -276,7 +277,7 @@ func (_c *Store_ConsumePrewarmForecast_Call) Return(_a0 error) *Store_ConsumePre
 	return _c
 }
 
-func (_c *Store_ConsumePrewarmForecast_Call) RunAndReturn(run func(context.Context, string, int64, int64, string) error) *Store_ConsumePrewarmForecast_Call {
+func (_c *Store_ConsumePrewarmForecast_Call) RunAndReturn(run func(context.Context, string, int64, int64, int64, string) error) *Store_ConsumePrewarmForecast_Call {
 	_c.Call.Return(run)
 	return _c
 }

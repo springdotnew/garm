@@ -165,13 +165,28 @@ func (s *sqlDatabase) ListActivePrewarmRequests(_ context.Context, entityID stri
 // been queued for a run, reducing the remaining forecast for that target by
 // one. Real queued work always takes priority over prediction: once GitHub has
 // queued a job, the ordinary queued-job path owns it.
-func (s *sqlDatabase) ConsumePrewarmForecast(_ context.Context, entityID string, runID, runAttempt int64, labelKey string) error {
+//
+// A job consumes at most once, however many times GitHub delivers its webhook.
+// The claim is a conditional UPDATE on the job row, so redeliveries — and
+// concurrent deliveries of the same job — cannot quietly eat the forecast.
+func (s *sqlDatabase) ConsumePrewarmForecast(_ context.Context, entityID string, workflowJobID, runID, runAttempt int64, labelKey string) error {
 	asUUID, err := uuid.Parse(entityID)
 	if err != nil {
 		return fmt.Errorf("error parsing entity id: %w", err)
 	}
 
 	return s.conn.Transaction(func(tx *gorm.DB) error {
+		claim := tx.Model(&WorkflowJob{}).
+			Where("workflow_job_id = ? AND prewarm_consumed = ?", workflowJobID, false).
+			UpdateColumn("prewarm_consumed", true)
+		if claim.Error != nil {
+			return fmt.Errorf("error claiming forecast consumption: %w", claim.Error)
+		}
+		if claim.RowsAffected == 0 {
+			// Either this job already consumed, or it is not one of ours.
+			return nil
+		}
+
 		var requests []PrewarmRequest
 		q := tx.Where("entity_id = ? AND run_id = ? AND run_attempt = ?", asUUID, runID, runAttempt).
 			Find(&requests)
@@ -310,21 +325,35 @@ func (s *sqlDatabase) CountSpeculativeInstances(_ context.Context) (int64, error
 	return count, nil
 }
 
-// CountPoolAvailableCapacity counts the runners of a pool that are not yet
-// serving a job and could take one: pending, installing or idle. The prewarm
-// reconciler subtracts this from a forecast so it never stacks speculative
-// capacity on top of capacity that already exists.
+// CountPoolAvailableCapacity counts the runners of a pool that are provably
+// uncommitted, so the prewarm reconciler never stacks speculative capacity on
+// top of capacity that already exists.
+//
+// Two kinds of runner qualify:
+//
+//   - a speculative runner nobody has claimed, at any stage of its boot; and
+//   - an ordinary runner that has finished booting and is sitting idle.
+//
+// An ordinary runner that is still booting does not qualify. GARM creates those
+// in response to a specific queued job, so counting them would let the job that
+// triggered a forecast cancel out part of the forecast it triggered.
 func (s *sqlDatabase) CountPoolAvailableCapacity(_ context.Context, poolID string) (int64, error) {
 	asUUID, err := uuid.Parse(poolID)
 	if err != nil {
 		return 0, fmt.Errorf("error parsing pool id: %w", err)
 	}
 
+	uncommittedSpeculative := s.conn.
+		Where("speculative = ? AND reserved_for_workflow_job_id IS NULL AND status IN ? AND runner_status IN ?",
+			true, speculativeClaimableStatuses,
+			[]params.RunnerStatus{params.RunnerPending, params.RunnerInstalling, params.RunnerIdle}).
+		Or("speculative = ? AND status = ? AND runner_status = ?",
+			false, commonParams.InstanceRunning, params.RunnerIdle)
+
 	var count int64
 	q := s.conn.Model(&Instance{}).
-		Where("pool_id = ? AND status IN ? AND runner_status IN ?",
-			asUUID, speculativeClaimableStatuses,
-			[]params.RunnerStatus{params.RunnerPending, params.RunnerInstalling, params.RunnerIdle}).
+		Where("pool_id = ?", asUUID).
+		Where(uncommittedSpeculative).
 		Count(&count)
 	if q.Error != nil {
 		return 0, fmt.Errorf("error counting pool capacity: %w", q.Error)

@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/suite"
 
 	runnerErrors "github.com/cloudbase/garm-provider-common/errors"
@@ -105,6 +106,37 @@ func (s *PrewarmTestSuite) createRequestParams() params.CreatePrewarmRequestPara
 			{LabelKey: largeLabelKey, Labels: []string{largeLabelKey}, TargetCount: 2},
 		},
 	}
+}
+
+// queueJob records a queued job for the suite's run. Consumption is claimed
+// against the job row, so a job has to exist before it can consume anything.
+func (s *PrewarmTestSuite) queueJob(workflowJobID int64) params.Job {
+	s.T().Helper()
+
+	orgID, err := uuid.Parse(s.entity.ID)
+	s.Require().NoError(err)
+
+	job, err := s.store.CreateOrUpdateJob(s.adminCtx, params.Job{
+		WorkflowJobID: workflowJobID,
+		RunID:         30263041273,
+		RunAttempt:    1,
+		WorkflowName:  "PR Tests",
+		Name:          "build",
+		Action:        "queued",
+		Status:        "queued",
+		Labels:        []string{spotLabelKey},
+		OrgID:         &orgID,
+	})
+	s.Require().NoError(err)
+	return job
+}
+
+// consume queues a job and consumes its unit of the forecast.
+func (s *PrewarmTestSuite) consume(workflowJobID int64, request params.PrewarmRequest, labelKey string) error {
+	s.T().Helper()
+	s.queueJob(workflowJobID)
+	return s.store.ConsumePrewarmForecast(
+		s.adminCtx, s.entity.ID, workflowJobID, request.RunID, request.RunAttempt, labelKey)
 }
 
 // createSpeculativeInstance adds a speculative runner to the suite's pool.
@@ -197,9 +229,8 @@ func (s *PrewarmTestSuite) TestConsumeForecastReducesRemaining() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
 
-	for i := 0; i < 3; i++ {
-		s.Require().NoError(s.store.ConsumePrewarmForecast(
-			s.adminCtx, s.entity.ID, request.RunID, request.RunAttempt, spotLabelKey))
+	for i := int64(0); i < 3; i++ {
+		s.Require().NoError(s.consume(500+i, request, spotLabelKey))
 	}
 
 	active, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
@@ -224,9 +255,8 @@ func (s *PrewarmTestSuite) TestConsumeForecastFloorsAtZero() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
 
-	for i := 0; i < 12; i++ {
-		s.Require().NoError(s.store.ConsumePrewarmForecast(
-			s.adminCtx, s.entity.ID, request.RunID, request.RunAttempt, spotLabelKey))
+	for i := int64(0); i < 12; i++ {
+		s.Require().NoError(s.consume(600+i, request, spotLabelKey))
 	}
 
 	active, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
@@ -246,14 +276,18 @@ func (s *PrewarmTestSuite) TestConcurrentForecastConsumptionDoesNotLoseUpdates()
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
 
+	for i := int64(0); i < 5; i++ {
+		s.queueJob(700 + i)
+	}
+
 	var wg sync.WaitGroup
-	for i := 0; i < 5; i++ {
+	for i := int64(0); i < 5; i++ {
 		wg.Add(1)
-		go func() {
+		go func(jobID int64) {
 			defer wg.Done()
 			_ = s.store.ConsumePrewarmForecast(
-				s.adminCtx, s.entity.ID, request.RunID, request.RunAttempt, spotLabelKey)
-		}()
+				s.adminCtx, s.entity.ID, jobID, request.RunID, request.RunAttempt, spotLabelKey)
+		}(700 + i)
 	}
 	wg.Wait()
 
@@ -263,6 +297,67 @@ func (s *PrewarmTestSuite) TestConcurrentForecastConsumptionDoesNotLoseUpdates()
 		if target.LabelKey == spotLabelKey {
 			s.Require().Equal(uint(5), target.ObservedDemand)
 		}
+	}
+}
+
+// GitHub redelivers webhooks. A job that consumed once must never consume
+// again, or a redelivery would silently shrink the forecast it belongs to.
+func (s *PrewarmTestSuite) TestRedeliveredJobConsumesForecastOnce() {
+	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
+	s.Require().NoError(err)
+
+	for range 4 {
+		s.Require().NoError(s.consume(801, request, spotLabelKey))
+	}
+
+	active, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
+	s.Require().NoError(err)
+	for _, target := range active[0].Targets {
+		if target.LabelKey == spotLabelKey {
+			s.Require().Equal(uint(1), target.ObservedDemand)
+			s.Require().Equal(uint(4), target.RemainingForecast())
+		}
+	}
+}
+
+func (s *PrewarmTestSuite) TestConcurrentRedeliveriesConsumeForecastOnce() {
+	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
+	s.Require().NoError(err)
+	s.queueJob(802)
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = s.store.ConsumePrewarmForecast(
+				s.adminCtx, s.entity.ID, 802, request.RunID, request.RunAttempt, spotLabelKey)
+		}()
+	}
+	wg.Wait()
+
+	active, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
+	s.Require().NoError(err)
+	for _, target := range active[0].Targets {
+		if target.LabelKey == spotLabelKey {
+			s.Require().Equal(uint(1), target.ObservedDemand)
+		}
+	}
+}
+
+// A job GARM never recorded cannot consume anything. This is what keeps a
+// webhook for an unrelated entity from eating another entity's forecast.
+func (s *PrewarmTestSuite) TestUnknownJobConsumesNothing() {
+	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
+	s.Require().NoError(err)
+
+	s.Require().NoError(s.store.ConsumePrewarmForecast(
+		s.adminCtx, s.entity.ID, 999999, request.RunID, request.RunAttempt, spotLabelKey))
+
+	active, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
+	s.Require().NoError(err)
+	for _, target := range active[0].Targets {
+		s.Require().Zero(target.ObservedDemand)
 	}
 }
 
@@ -424,27 +519,49 @@ func (s *PrewarmTestSuite) TestCountSpeculativeInstances() {
 	s.Require().Equal(int64(2), count)
 }
 
-// Existing idle or pending capacity must reduce the deficit the reconciler
-// creates, otherwise every forecast stacks on top of the last.
+// Uncommitted capacity must reduce the deficit the reconciler creates,
+// otherwise every forecast stacks on top of the last. Capacity that is already
+// spoken for must not, or a run would cancel out the forecast it triggered.
 func (s *PrewarmTestSuite) TestCountPoolAvailableCapacity() {
 	available, err := s.store.CountPoolAvailableCapacity(s.adminCtx, s.pool.ID)
 	s.Require().NoError(err)
 	s.Require().Zero(available)
 
+	// Booted and idle: available to anyone.
 	_, err = s.store.CreateInstance(s.adminCtx, s.pool.ID, params.CreateInstanceParams{
 		Name: "idle-runner", OSType: "linux", OSArch: "amd64",
 		Status: commonParams.InstanceRunning, RunnerStatus: params.RunnerIdle,
 	})
 	s.Require().NoError(err)
+
+	// Booting in response to a queued job: already spoken for.
 	_, err = s.store.CreateInstance(s.adminCtx, s.pool.ID, params.CreateInstanceParams{
-		Name: "pending-runner", OSType: "linux", OSArch: "amd64",
+		Name: "job-response-runner", OSType: "linux", OSArch: "amd64",
 		Status: commonParams.InstancePendingCreate, RunnerStatus: params.RunnerPending,
 	})
 	s.Require().NoError(err)
 
 	available, err = s.store.CountPoolAvailableCapacity(s.adminCtx, s.pool.ID)
 	s.Require().NoError(err)
+	s.Require().Equal(int64(1), available)
+
+	// Speculative and unclaimed: available even while it boots.
+	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
+	s.Require().NoError(err)
+	speculative := s.createSpeculativeInstance("spec-a", request.ID, time.Now().Add(8*time.Minute))
+
+	available, err = s.store.CountPoolAvailableCapacity(s.adminCtx, s.pool.ID)
+	s.Require().NoError(err)
 	s.Require().Equal(int64(2), available)
+
+	// Claimed by a job: no longer available to the next forecast.
+	_, err = s.store.ClaimSpeculativeInstance(s.adminCtx, []string{s.pool.ID}, 909)
+	s.Require().NoError(err)
+	s.Require().NotEmpty(speculative.Name)
+
+	available, err = s.store.CountPoolAvailableCapacity(s.adminCtx, s.pool.ID)
+	s.Require().NoError(err)
+	s.Require().Equal(int64(1), available)
 }
 
 func (s *PrewarmTestSuite) TestPrewarmCounters() {

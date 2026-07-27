@@ -63,7 +63,7 @@ type Prewarm struct {
 	MaxSpeculativeRunners uint `toml:"max_speculative_runners" json:"max-speculative-runners"`
 	// DefaultTTL is how long an unclaimed speculative runner is kept before it
 	// is reaped. Rules may override it.
-	DefaultTTL prewarmTTL `toml:"default_ttl" json:"default-ttl"`
+	DefaultTTL PrewarmTTL `toml:"default_ttl" json:"default-ttl"`
 	// Rules are the trigger definitions. Rule IDs must be unique.
 	Rules []PrewarmRule `toml:"rule,omitempty" json:"rule,omitempty"`
 }
@@ -162,7 +162,7 @@ type PrewarmRule struct {
 	// different pool set.
 	RunAttempt int64 `toml:"run_attempt,omitempty" json:"run-attempt,omitempty"`
 	// TTL overrides the global DefaultTTL for runners created by this rule.
-	TTL prewarmTTL `toml:"ttl,omitempty" json:"ttl,omitempty"`
+	TTL PrewarmTTL `toml:"ttl,omitempty" json:"ttl,omitempty"`
 	// Targets is the forecast pool mix, keyed by the label set a downstream job
 	// will request.
 	Targets []PrewarmTarget `toml:"target,omitempty" json:"target,omitempty"`
@@ -303,12 +303,12 @@ func validateRepositorySlug(slug string) error {
 	return nil
 }
 
-// prewarmTTL is a duration expressed as a TOML string, following the same
+// PrewarmTTL is a duration expressed as a TOML string, following the same
 // pattern as the JWT time_to_live setting.
-type prewarmTTL string
+type PrewarmTTL string
 
 // ParseDuration parses the TTL. An unset TTL is valid and parses to zero.
-func (d *prewarmTTL) ParseDuration() (time.Duration, error) {
+func (d *PrewarmTTL) ParseDuration() (time.Duration, error) {
 	if *d == "" {
 		return 0, nil
 	}
@@ -324,7 +324,7 @@ func (d *prewarmTTL) ParseDuration() (time.Duration, error) {
 
 // DurationOr returns the parsed duration, falling back to fallback when the
 // TTL is unset or unparsable.
-func (d *prewarmTTL) DurationOr(fallback time.Duration) time.Duration {
+func (d *PrewarmTTL) DurationOr(fallback time.Duration) time.Duration {
 	duration, err := d.ParseDuration()
 	if err != nil {
 		slog.With(slog.Any("error", err)).Error("failed to parse prewarm ttl")
@@ -339,12 +339,12 @@ func (d *prewarmTTL) DurationOr(fallback time.Duration) time.Duration {
 // UnmarshalText validates the duration as the TOML document is decoded, so a
 // typo is reported against the offending line instead of silently becoming a
 // zero TTL.
-func (d *prewarmTTL) UnmarshalText(text []byte) error {
+func (d *PrewarmTTL) UnmarshalText(text []byte) error {
 	if len(text) > 0 {
 		if _, err := time.ParseDuration(string(text)); err != nil {
 			return fmt.Errorf("invalid duration: %w", err)
 		}
 	}
-	*d = prewarmTTL(text)
+	*d = PrewarmTTL(text)
 	return nil
 }
