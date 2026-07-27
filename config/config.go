@@ -94,6 +94,7 @@ type Config struct {
 	JWTAuth   JWTAuth    `toml:"jwt_auth" json:"jwt-auth"`
 	Logging   Logging    `toml:"logging" json:"logging"`
 	Proxy     Proxy      `toml:"proxy" json:"proxy"`
+	Prewarm   Prewarm    `toml:"prewarm,omitempty" json:"prewarm,omitempty"`
 }
 
 // Validate validates the config
@@ -119,6 +120,10 @@ func (c *Config) Validate() error {
 
 	if err := c.Proxy.Validate(); err != nil {
 		return fmt.Errorf("failed to validate proxy settings: %w", err)
+	}
+
+	if err := c.Prewarm.Validate(); err != nil {
+		return fmt.Errorf("error validating prewarm config: %w", err)
 	}
 
 	providerNames := map[string]int{}
