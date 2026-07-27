@@ -132,6 +132,14 @@ definitions:
                 format: uint64
                 type: integer
                 x-go-name: MinimumJobAgeBackoff
+            prewarm_paused:
+                description: |-
+                    PrewarmPaused is the runtime kill switch for speculative prewarming.
+                    While set, no speculative runner is created, but rules stay configured
+                    and scaling for real queued jobs is completely unaffected. It takes
+                    effect immediately, without a restart or a config change.
+                type: boolean
+                x-go-name: PrewarmPaused
             version:
                 description: Version is the version of the GARM controller.
                 type: string
@@ -1323,6 +1331,14 @@ definitions:
                     created.
                 type: string
                 x-go-name: ProviderName
+            reserved_for_workflow_job_id:
+                description: |-
+                    ReservedForWorkflowJobID is the workflow job that claimed this
+                    speculative runner. A runner with this set is real work and is never
+                    reaped as speculative surplus.
+                format: int64
+                type: integer
+                x-go-name: ReservedForWorkflowJobID
             runner_status:
                 $ref: '#/definitions/RunnerStatus'
             scale_set_id:
@@ -1330,6 +1346,25 @@ definitions:
                 format: uint64
                 type: integer
                 x-go-name: ScaleSetID
+            speculative:
+                description: |-
+                    Speculative marks a runner created from a prewarm forecast rather than
+                    from a job GitHub had actually queued.
+                type: boolean
+                x-go-name: Speculative
+            speculative_expires_at:
+                description: |-
+                    SpeculativeExpiresAt is when an unclaimed speculative runner becomes
+                    eligible for reaping.
+                format: date-time
+                type: string
+                x-go-name: SpeculativeExpiresAt
+            speculative_request_id:
+                description: |-
+                    SpeculativeRequestID links a speculative runner back to the forecast
+                    that created it.
+                type: string
+                x-go-name: SpeculativeRequestID
             status:
                 $ref: '#/definitions/InstanceStatus'
             status_messages:
@@ -1496,6 +1531,11 @@ definitions:
             repository_owner:
                 type: string
                 x-go-name: RepositoryOwner
+            run_attempt:
+                description: RunAttempt is the attempt number of the workflow run this job belongs to.
+                format: int64
+                type: integer
+                x-go-name: RunAttempt
             run_id:
                 description: RunID is the ID of the workflow run. A run may have multiple jobs.
                 format: int64
@@ -1537,6 +1577,10 @@ definitions:
                 format: int64
                 type: integer
                 x-go-name: WorkflowJobID
+            workflow_name:
+                description: WorkflowName is the name of the workflow the job belongs to.
+                type: string
+                x-go-name: WorkflowName
             workflow_run_url:
                 type: string
                 x-go-name: WorkflowRunURL
@@ -2246,6 +2290,13 @@ definitions:
                 format: uint64
                 type: integer
                 x-go-name: MinimumJobAgeBackoff
+            prewarm_paused:
+                description: |-
+                    PrewarmPaused is the runtime kill switch for speculative prewarming.
+                    Setting it stops speculative runner creation immediately; it does not
+                    change any rule and does not affect scaling for real queued jobs.
+                type: boolean
+                x-go-name: PrewarmPaused
             webhook_url:
                 type: string
                 x-go-name: WebhookURL

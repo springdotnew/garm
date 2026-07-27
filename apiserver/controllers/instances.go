@@ -395,6 +395,26 @@ func (a *APIController) InstanceStatusMessageHandler(w http.ResponseWriter, r *h
 	w.WriteHeader(http.StatusOK)
 }
 
+// InstancePreemptedHandler is how a runner tells GARM that its cloud has served
+// it a preemption notice. The notice arrives only on the machine that is about
+// to go away, and only seconds before it does, so the runner is the only thing
+// that can report it and this is the only chance to act on it.
+//
+// The body is deliberately empty: the caller is authenticated as an instance,
+// which is the whole message.
+func (a *APIController) InstancePreemptedHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	if err := a.r.ReportInstancePreempted(ctx); err != nil {
+		slog.With(slog.Any("error", err)).ErrorContext(ctx, "error recording preemption notice")
+		handleError(ctx, w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+}
+
 func (a *APIController) InstanceSystemInfoHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 

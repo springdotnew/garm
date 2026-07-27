@@ -51,7 +51,11 @@ type WorkflowJob struct {
 		StartedAt   time.Time `json:"started_at"`
 		CompletedAt time.Time `json:"completed_at"`
 		Name        string    `json:"name"`
-		Steps       []struct {
+		// WorkflowName is the name of the workflow the job belongs to. GitHub
+		// sends it on every workflow_job event; it is what lets a prewarm rule
+		// recognise the gate job of a known workflow.
+		WorkflowName string `json:"workflow_name"`
+		Steps        []struct {
 			Name        string    `json:"name"`
 			Status      string    `json:"status"`
 			Conclusion  string    `json:"conclusion"`

@@ -2,6 +2,8 @@
 
 Runner startup time is the main performance concern in GARM. Each new runner must boot an instance, download the GitHub Actions runner binary, install dependencies, and register. These tips help minimize that time.
 
+If your workflows fan out behind a gate job, [speculative prewarming](prewarm.md) can move that boot off the critical path entirely by starting it while the gate is still running.
+
 ## Cache the runner binary in images
 
 The biggest time saver. Pre-install the GitHub Actions runner binary in your image so GARM doesn't download it on every boot.

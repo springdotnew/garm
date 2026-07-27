@@ -43,6 +43,7 @@ var (
 	minimumJobAgeBackoff uint
 	controllerCABundle   string
 	clearCABundle        bool
+	prewarmPaused        bool
 )
 
 // initCmd represents the init command

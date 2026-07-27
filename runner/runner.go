@@ -117,7 +117,7 @@ func (p *poolManagerCtrl) CreateRepoPoolManager(ctx context.Context, repo params
 		return nil, fmt.Errorf("error getting entity: %w", err)
 	}
 
-	poolManager, err := pool.NewEntityPoolManager(ctx, entity, p.token, providers, store)
+	poolManager, err := pool.NewEntityPoolManager(ctx, entity, p.token, providers, store, p.config.Prewarm)
 	if err != nil {
 		return nil, fmt.Errorf("error creating repo pool manager: %w", err)
 	}
@@ -159,7 +159,7 @@ func (p *poolManagerCtrl) CreateOrgPoolManager(ctx context.Context, org params.O
 		return nil, fmt.Errorf("error getting entity: %w", err)
 	}
 
-	poolManager, err := pool.NewEntityPoolManager(ctx, entity, p.token, providers, store)
+	poolManager, err := pool.NewEntityPoolManager(ctx, entity, p.token, providers, store, p.config.Prewarm)
 	if err != nil {
 		return nil, fmt.Errorf("error creating org pool manager: %w", err)
 	}
@@ -201,7 +201,7 @@ func (p *poolManagerCtrl) CreateEnterprisePoolManager(ctx context.Context, enter
 		return nil, fmt.Errorf("error getting entity: %w", err)
 	}
 
-	poolManager, err := pool.NewEntityPoolManager(ctx, entity, p.token, providers, store)
+	poolManager, err := pool.NewEntityPoolManager(ctx, entity, p.token, providers, store, p.config.Prewarm)
 	if err != nil {
 		return nil, fmt.Errorf("error creating enterprise pool manager: %w", err)
 	}
@@ -243,7 +243,7 @@ func (p *poolManagerCtrl) CreateForgeInstancePoolManager(ctx context.Context, fo
 		return nil, fmt.Errorf("error getting entity: %w", err)
 	}
 
-	poolManager, err := pool.NewEntityPoolManager(ctx, entity, p.token, providers, store)
+	poolManager, err := pool.NewEntityPoolManager(ctx, entity, p.token, providers, store, p.config.Prewarm)
 	if err != nil {
 		return nil, fmt.Errorf("error creating forge instance pool manager: %w", err)
 	}

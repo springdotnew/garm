@@ -76,6 +76,14 @@ func (s *sqlDatabase) sqlToParamsInstance(instance Instance) (params.Instance, e
 		AditionalLabels:   labels,
 		Heartbeat:         instance.Heartbeat,
 		Generation:        instance.Generation,
+
+		Speculative:              instance.Speculative,
+		SpeculativeExpiresAt:     instance.SpeculativeExpiresAt,
+		ReservedForWorkflowJobID: instance.ReservedForWorkflowJobID,
+	}
+
+	if instance.SpeculativeRequestID != nil {
+		ret.SpeculativeRequestID = instance.SpeculativeRequestID.String()
 	}
 
 	if len(instance.Capabilities) > 0 {

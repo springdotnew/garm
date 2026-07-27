@@ -75,6 +75,11 @@ type ControllerInfo struct {
 	// pick up the job. GARM would allow this amount of time for runners to react
 	// before spinning up a new one and potentially having to scale down later.
 	MinimumJobAgeBackoff uint
+
+	// PrewarmPaused is the runtime kill switch for speculative prewarming. It
+	// lives on the controller rather than in configuration so it can be
+	// flipped without a restart and survives one.
+	PrewarmPaused bool
 	// CachedGARMAgentReleases stores the release index fetched from
 	// GARMAgentReleasesURL: the source URL plus the list of releases
 	// (a marshaled util.AgentReleaseIndex).
@@ -435,6 +440,22 @@ type Instance struct {
 	GitHubRunnerGroup string
 	AditionalLabels   datatypes.JSON
 	Capabilities      datatypes.JSON
+
+	// Speculative marks a runner that was created from a prewarm forecast
+	// rather than from a job that GitHub had actually queued. It stays set for
+	// the lifetime of the runner so idle time and claim rates can be accounted
+	// for; ReservedForWorkflowJobID is what marks it as claimed.
+	Speculative bool `gorm:"index:idx_instances_speculative,priority:1"`
+	// SpeculativeRequestID links the runner back to the forecast that created
+	// it.
+	SpeculativeRequestID *uuid.UUID `gorm:"index"`
+	// SpeculativeExpiresAt is when an unclaimed speculative runner becomes
+	// eligible for reaping.
+	SpeculativeExpiresAt *time.Time `gorm:"index:idx_instances_speculative,priority:2"`
+	// ReservedForWorkflowJobID is the workflow job that claimed this
+	// speculative runner. Once set, the runner is real work and must never be
+	// reaped as surplus.
+	ReservedForWorkflowJobID *int64 `gorm:"index"`
 	// Generation is the pool generation at the time of creating this instance.
 	// This field is to track a divergence between when the instance was created
 	// and the settings currently set on a pool. We can then use this field to know
@@ -476,6 +497,16 @@ type WorkflowJob struct {
 
 	// RunID is the ID of the workflow run. A run may have multiple jobs.
 	RunID int64
+	// RunAttempt is the attempt number of the workflow run this job belongs to.
+	RunAttempt int64
+	// WorkflowName is the name of the workflow this job belongs to. Prewarm
+	// rules match on it, so it must survive a controller restart alongside the
+	// job itself.
+	WorkflowName string `gorm:"index:idx_workflow_jobs_workflow_name"`
+	// PrewarmConsumed records that this job has already taken its unit of the
+	// prewarm forecast. GitHub delivers a webhook more than once often enough
+	// that without it, a redelivery would quietly shrink the forecast.
+	PrewarmConsumed bool
 	// Action is the specific activity that triggered the event.
 	Action string `gorm:"type:varchar(254);index"`
 	// Conclusion is the outcome of the job.
@@ -688,4 +719,64 @@ type FileObjectTag struct {
 	ID           uint   `gorm:"primaryKey"`
 	FileObjectID uint   `gorm:"index:idx_fileobject_tags_doc_id,priority:1;index:idx_fileobject_tags_tag,priority:1;not null"`
 	Tag          string `gorm:"index:idx_fileobject_tags_tag,priority:2,expression:LOWER(tag);not null"`
+}
+
+// PrewarmRequest is one matched prewarm rule: the forecast that a workflow
+// run's gate job is about to unblock a known fanout. It survives a controller
+// restart so a cohort is never created twice for the same run.
+type PrewarmRequest struct {
+	Base
+
+	// EntityID and EntityType identify the pool manager that owns the request.
+	EntityID   uuid.UUID `gorm:"index:idx_prewarm_request_dedup,unique,priority:1;index:idx_prewarm_request_entity_state,priority:1"`
+	EntityType string
+
+	// Repository, WorkflowName, RunID and RunAttempt identify the workflow run
+	// the forecast was made for. Together with RuleID they are the dedup key:
+	// a duplicate webhook delivery must not create a second cohort.
+	Repository   string `gorm:"index:idx_prewarm_request_dedup,unique,priority:2"`
+	WorkflowName string `gorm:"index:idx_prewarm_request_dedup,unique,priority:3"`
+	RunID        int64  `gorm:"index:idx_prewarm_request_dedup,unique,priority:4"`
+	RunAttempt   int64  `gorm:"index:idx_prewarm_request_dedup,unique,priority:5"`
+	RuleID       string `gorm:"index:idx_prewarm_request_dedup,unique,priority:6"`
+
+	// TriggerJobID is the workflow job whose queueing matched the rule. It is
+	// recorded so the forecast can be correlated with the gate in the logs.
+	TriggerJobID int64
+
+	// Mode is the prewarm mode in force when the request was created. It is
+	// stored rather than read back from config so that flipping the switch
+	// mid-flight cannot retroactively change what a cohort was allowed to do.
+	Mode string
+	// State is one of shadow, active, expired or completed.
+	State string `gorm:"index:idx_prewarm_request_entity_state,priority:2"`
+	// ExpiresAt is when unclaimed capacity from this request may be reaped.
+	ExpiresAt time.Time `gorm:"index"`
+
+	Targets []PrewarmRequestTarget `gorm:"foreignKey:PrewarmRequestID;constraint:OnDelete:CASCADE,OnUpdate:CASCADE;"`
+}
+
+// PrewarmRequestTarget is one pool's worth of forecast demand within a
+// request, addressed by the canonical label key of the runners it forecasts.
+type PrewarmRequestTarget struct {
+	Base
+
+	PrewarmRequestID uuid.UUID `gorm:"index:idx_prewarm_target_label,unique,priority:1"`
+	// LabelKey is the canonical (sorted, lowercased) label set. It is the
+	// identity of the target within the request.
+	LabelKey string `gorm:"index:idx_prewarm_target_label,unique,priority:2"`
+	// Labels is the label set as configured, preserved for pool lookups.
+	Labels datatypes.JSON
+
+	// TargetCount is how many runners the profile forecast for this label set.
+	TargetCount uint
+	// ObservedDemand is how many real jobs with this label set have since been
+	// queued for the same run. The remaining forecast is TargetCount minus
+	// this, floored at zero.
+	ObservedDemand uint
+	// CreatedCount, ClaimedCount and ReapedCount are the lifecycle counters
+	// behind the forecast-accuracy metrics.
+	CreatedCount uint
+	ClaimedCount uint
+	ReapedCount  uint
 }

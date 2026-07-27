@@ -92,7 +92,19 @@ func (s *sqlDatabase) CreateInstance(ctx context.Context, poolID string, param p
 			AditionalLabels:   labels,
 			AgentID:           param.AgentID,
 			Generation:        param.Generation,
+
+			Speculative:          param.Speculative,
+			SpeculativeExpiresAt: param.SpeculativeExpiresAt,
 		}
+
+		if param.SpeculativeRequestID != "" {
+			requestID, err := uuid.Parse(param.SpeculativeRequestID)
+			if err != nil {
+				return fmt.Errorf("error parsing speculative request id: %w", err)
+			}
+			newInstance.SpeculativeRequestID = &requestID
+		}
+
 		q = tx.Create(&newInstance)
 		if q.Error != nil {
 			return fmt.Errorf("error creating instance: %w", q.Error)

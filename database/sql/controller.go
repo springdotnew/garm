@@ -74,6 +74,7 @@ func dbControllerToCommonController(dbInfo ControllerInfo) (params.ControllerInf
 		CallbackURL:                     dbInfo.CallbackURL,
 		AgentURL:                        agentURL,
 		MinimumJobAgeBackoff:            dbInfo.MinimumJobAgeBackoff,
+		PrewarmPaused:                   dbInfo.PrewarmPaused,
 		Version:                         appdefaults.GetVersion(),
 		GARMAgentReleasesURL:            dbInfo.GARMAgentReleasesURL,
 		SyncGARMAgentTools:              dbInfo.SyncGARMAgentTools,
@@ -220,6 +221,10 @@ func controllerUpdates(info params.UpdateControllerParams, dbInfo ControllerInfo
 
 	if info.AllowInsecureGARMAgent != nil && *info.AllowInsecureGARMAgent != dbInfo.AllowInsecureGARMAgent {
 		updates["allow_insecure_garm_agent"] = *info.AllowInsecureGARMAgent
+	}
+
+	if info.PrewarmPaused != nil && *info.PrewarmPaused != dbInfo.PrewarmPaused {
+		updates["prewarm_paused"] = *info.PrewarmPaused
 	}
 
 	if info.MinimumJobAgeBackoff != nil && *info.MinimumJobAgeBackoff != dbInfo.MinimumJobAgeBackoff {

@@ -26,6 +26,7 @@ import (
 	commonParams "github.com/cloudbase/garm-provider-common/params"
 	"github.com/cloudbase/garm-provider-common/util"
 	"github.com/cloudbase/garm/cache"
+	"github.com/cloudbase/garm/config"
 	dbCommon "github.com/cloudbase/garm/database/common"
 	"github.com/cloudbase/garm/database/watcher"
 	garmErrors "github.com/cloudbase/garm/internal/errors"
@@ -41,7 +42,7 @@ const (
 	scaleDownIdleGrace           = 30 * time.Second
 )
 
-func NewWorker(ctx context.Context, store dbCommon.Store, scaleSet params.ScaleSet, provider common.Provider) (*Worker, error) {
+func NewWorker(ctx context.Context, store dbCommon.Store, scaleSet params.ScaleSet, provider common.Provider, prewarm config.Prewarm) (*Worker, error) {
 	consumerID := fmt.Sprintf("scaleset-worker-%s-%d", scaleSet.Name, scaleSet.ID)
 	controllerInfo, err := store.ControllerInfo()
 	if err != nil {
@@ -67,6 +68,7 @@ func NewWorker(ctx context.Context, store dbCommon.Store, scaleSet params.ScaleS
 		provider:        provider,
 		scaleSet:        scaleSet,
 		entity:          entity,
+		prewarm:         prewarm,
 		runners:         make(map[string]params.Instance),
 		runnerSnapshots: make(map[string]time.Time),
 		autoScaleWake:   make(chan struct{}, 1),
@@ -82,6 +84,7 @@ type Worker struct {
 	store    dbCommon.Store
 	scaleSet params.ScaleSet
 	entity   params.ForgeEntity
+	prewarm  config.Prewarm
 	runners  map[string]params.Instance
 	// runnerSnapshots records the newest database timestamp observed for each
 	// runner, including runners removed from the cache. Instance watcher
@@ -93,8 +96,12 @@ type Worker struct {
 	listener          *scaleSetListener
 	autoScaleWake     chan struct{}
 	creationsInFlight int
-	scaleSetClient    *scalesets.ScaleSetClient
-	scaleSetClientGen uint64
+	// speculativeRunners is the prewarm forecast this scale set is currently
+	// holding capacity for. It is refreshed once per autoscale pass so that a
+	// target stays stable for the whole of a critical section.
+	speculativeRunners int
+	scaleSetClient     *scalesets.ScaleSetClient
+	scaleSetClientGen  uint64
 
 	mux               sync.Mutex
 	scaleSetClientMux sync.Mutex
@@ -1209,7 +1216,15 @@ func (w *Worker) targetRunners() int {
 	if w.scaleSet.DesiredRunnerCount > 0 {
 		desiredRunners = uint(w.scaleSet.DesiredRunnerCount)
 	}
-	targetRunners := min(w.scaleSet.MinIdleRunners+desiredRunners, w.scaleSet.MaxRunners)
+	// Speculative runners are the forecast for jobs GitHub has not queued yet.
+	// They add to the target rather than replacing it: assigned jobs and
+	// predicted ones are different work, and a job that gets queued consumes
+	// its unit of the forecast, so the two do not double count for long.
+	var speculativeRunners uint
+	if w.speculativeRunners > 0 {
+		speculativeRunners = uint(w.speculativeRunners)
+	}
+	targetRunners := min(w.scaleSet.MinIdleRunners+desiredRunners+speculativeRunners, w.scaleSet.MaxRunners)
 
 	return int(targetRunners)
 }
@@ -1272,6 +1287,7 @@ func (w *Worker) handleAutoScale() {
 		}
 
 		w.mux.Lock()
+		w.refreshPrewarmForecastLocked()
 		for _, instance := range w.runners {
 			if err := w.handleInstanceCleanup(instance); err != nil {
 				slog.ErrorContext(w.ctx, "error cleaning up instance", "instance_id", instance.ID, "error", err)

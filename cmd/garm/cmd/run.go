@@ -179,7 +179,7 @@ func initInfrastructure(ctx context.Context, cfg *config.Config, hub *websocket.
 		return nil, fmt.Errorf("starting provider worker: %w", err)
 	}
 
-	entityCtrl, err := entity.NewController(ctx, db, loadedProviders)
+	entityCtrl, err := entity.NewController(ctx, db, loadedProviders, cfg.Prewarm)
 	if err != nil {
 		return nil, fmt.Errorf("creating entity controller: %w", err)
 	}

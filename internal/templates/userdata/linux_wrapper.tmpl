@@ -21,6 +21,32 @@ export no_proxy='{{ .NoProxy }}'
 
 LOCK_DIR="/tmp/garm-runner-bootstrap.lock"
 DONE_FILE="/tmp/garm-runner-bootstrap.done"
+CALLBACK_ENV_FILE="/run/garm/callback.env"
+
+# Hand the callback credentials to services that outlive this bootstrap. The
+# Spot preemption watchdog is why: its notice arrives long after the wrapper has
+# exited, on a machine that is seconds from disappearing, and reporting it is
+# the only chance GARM has to start the replacement before the retry is queued.
+# Root-only, on tmpfs, so it dies with the VM.
+#
+# Written through a unique temporary file because this wrapper can run twice at
+# once — that is what the lock below exists for — and never fatal: a runner that
+# cannot persist them simply does not report preemptions, which is not worth
+# failing a bootstrap over.
+function persist_callback_env() {
+	local tmp
+	mkdir -p "$(dirname "$CALLBACK_ENV_FILE")" || return 1
+	# mktemp creates at 0600, and its unique name is what makes two wrappers
+	# racing here safe.
+	tmp="$(mktemp "${CALLBACK_ENV_FILE}.XXXXXX")" || return 1
+	if printf 'CALLBACK_URL=%s\nBEARER_TOKEN=%s\n' "$CALLBACK_URL" "$BEARER_TOKEN" > "$tmp" && mv -f "$tmp" "$CALLBACK_ENV_FILE"; then
+		return 0
+	fi
+	rm -f "$tmp"
+	return 1
+}
+
+persist_callback_env || echo "failed to persist callback credentials; this runner cannot report a preemption notice"
 
 function call() {
 	PAYLOAD="$1"

@@ -46,6 +46,8 @@ func sqlWorkflowJobToParamsJob(job WorkflowJob) (params.Job, error) {
 		WorkflowJobID:   job.WorkflowJobID,
 		ScaleSetJobID:   job.ScaleSetJobID,
 		RunID:           job.RunID,
+		RunAttempt:      job.RunAttempt,
+		WorkflowName:    job.WorkflowName,
 		Action:          job.Action,
 		Status:          job.Status,
 		Name:            job.Name,
@@ -85,6 +87,8 @@ func (s *sqlDatabase) paramsJobToWorkflowJob(ctx context.Context, conn *gorm.DB,
 		ScaleSetJobID:   job.ScaleSetJobID,
 		WorkflowJobID:   job.WorkflowJobID,
 		RunID:           job.RunID,
+		RunAttempt:      job.RunAttempt,
+		WorkflowName:    job.WorkflowName,
 		Action:          job.Action,
 		Status:          job.Status,
 		Name:            job.Name,
@@ -484,6 +488,31 @@ func (s *sqlDatabase) ListAllJobs(_ context.Context) ([]params.Job, error) {
 func (s *sqlDatabase) GetJobByID(_ context.Context, jobID int64) (params.Job, error) {
 	var job WorkflowJob
 	query := s.conn.Model(&WorkflowJob{}).Preload("Instance").Where("workflow_job_id = ?", jobID)
+
+	if err := query.First(&job); err.Error != nil {
+		if errors.Is(err.Error, gorm.ErrRecordNotFound) {
+			return params.Job{}, runnerErrors.ErrNotFound
+		}
+		return params.Job{}, err.Error
+	}
+
+	return sqlWorkflowJobToParamsJob(job)
+}
+
+// GetJobByInstanceID returns the job a runner is executing. A runner is
+// ephemeral and runs exactly one job, so the most recently updated row that
+// points at that instance is the one it is on.
+func (s *sqlDatabase) GetJobByInstanceID(_ context.Context, instanceID string) (params.Job, error) {
+	asUUID, err := uuid.Parse(instanceID)
+	if err != nil {
+		return params.Job{}, fmt.Errorf("error parsing id: %w", runnerErrors.ErrBadRequest)
+	}
+
+	var job WorkflowJob
+	query := s.conn.Model(&WorkflowJob{}).
+		Preload("Instance").
+		Where("instance_id = ?", asUUID).
+		Order("updated_at DESC")
 
 	if err := query.First(&job); err.Error != nil {
 		if errors.Is(err.Error, gorm.ErrRecordNotFound) {

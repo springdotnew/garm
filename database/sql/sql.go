@@ -389,6 +389,8 @@ func (s *sqlDatabase) initSchema(tx *gorm.DB) error {
 		&ControllerInfo{},
 		&WorkflowJob{},
 		&ScaleSet{},
+		&PrewarmRequest{},
+		&PrewarmRequestTarget{},
 	); err != nil {
 		return fmt.Errorf("error running auto migrate: %w", err)
 	}

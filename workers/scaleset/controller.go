@@ -22,6 +22,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/cloudbase/garm/config"
 	dbCommon "github.com/cloudbase/garm/database/common"
 	"github.com/cloudbase/garm/database/watcher"
 	"github.com/cloudbase/garm/params"
@@ -32,7 +33,7 @@ import (
 
 const scaleSetRetryLoopInterval = 5 * time.Second
 
-func NewController(ctx context.Context, store dbCommon.Store, entity params.ForgeEntity, providers map[string]common.Provider) (*Controller, error) {
+func NewController(ctx context.Context, store dbCommon.Store, entity params.ForgeEntity, providers map[string]common.Provider, prewarm config.Prewarm) (*Controller, error) {
 	consumerID := fmt.Sprintf("scaleset-controller-%s", entity.ID)
 
 	ctx = garmUtil.WithSlogContext(
@@ -48,6 +49,7 @@ func NewController(ctx context.Context, store dbCommon.Store, entity params.Forg
 		Entity:     entity,
 		providers:  providers,
 		store:      store,
+		prewarm:    prewarm,
 		backoff:    workersCommon.NewBackoff(workersCommon.DefaultBackoffConfig()),
 	}, nil
 }
@@ -95,6 +97,7 @@ type Controller struct {
 	consumer  dbCommon.Consumer
 	store     dbCommon.Store
 	providers map[string]common.Provider
+	prewarm   config.Prewarm
 	backoff   *workersCommon.Backoff
 
 	eventQueue *workersCommon.UnboundedChan[dbCommon.ChangePayload]

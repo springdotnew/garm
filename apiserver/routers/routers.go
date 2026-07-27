@@ -162,6 +162,8 @@ func NewAPIRouter(han *controllers.APIController, authMiddleware, initMiddleware
 	callbackRouter.Handle("/status", http.HandlerFunc(han.InstanceStatusMessageHandler)).Methods("POST", "OPTIONS")
 	callbackRouter.Handle("/system-info/", http.HandlerFunc(han.InstanceSystemInfoHandler)).Methods("POST", "OPTIONS")
 	callbackRouter.Handle("/system-info", http.HandlerFunc(han.InstanceSystemInfoHandler)).Methods("POST", "OPTIONS")
+	callbackRouter.Handle("/preempted/", http.HandlerFunc(han.InstancePreemptedHandler)).Methods("POST", "OPTIONS")
+	callbackRouter.Handle("/preempted", http.HandlerFunc(han.InstancePreemptedHandler)).Methods("POST", "OPTIONS")
 	callbackRouter.Use(instanceMiddleware.Middleware)
 
 	///////////////////
