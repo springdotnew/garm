@@ -386,6 +386,23 @@ func (s *PrewarmPoolTestSuite) TestShadowModeCreatesNoRunners() {
 	s.Empty(s.allInstances(), "shadow mode must not create a single VM")
 }
 
+// In shadow the request log line is the whole of what an operator gets, so it
+// has to carry the forecast rather than merely announce that there was one.
+func (s *PrewarmPoolTestSuite) TestForecastIsRenderedForTheRequestLogLine() {
+	s.Equal("", formatForecast(nil))
+	s.Equal("linux,self-hosted,x64=4", formatForecast([]params.CreatePrewarmTargetParams{
+		{LabelKey: "linux,self-hosted,x64", TargetCount: 4},
+	}))
+	// Configuration order, not sorted: the line should read like the rule it
+	// came from.
+	s.Equal("gcp-2vcpu=17 gcp-4vcpu=81 gcp-8vcpu=10", formatForecast(
+		[]params.CreatePrewarmTargetParams{
+			{LabelKey: "gcp-2vcpu", TargetCount: 17},
+			{LabelKey: "gcp-4vcpu", TargetCount: 81},
+			{LabelKey: "gcp-8vcpu", TargetCount: 10},
+		}))
+}
+
 // Shadow mode exists to be read: an operator compares its forecast against the
 // fanout that actually queued before switching a rule on. A shadow request that
 // publishes nothing is a silent dry run, which is no use to anyone.

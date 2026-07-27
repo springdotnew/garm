@@ -124,11 +124,10 @@ func (w *Worker) publishShadowForecast() {
 	if forecast > w.scaleSet.MaxRunners {
 		forecast = w.scaleSet.MaxRunners
 	}
+
+	// Metric only, exactly like the active path below. This runs on every
+	// autoscale pass, so a log line here repeats itself every few seconds for
+	// the life of the forecast; the pool manager logs the forecast once, where
+	// it is made.
 	metrics.PrewarmTargetRunners.WithLabelValues(labelKey, w.consumerID).Set(float64(forecast))
-	if forecast > 0 {
-		slog.InfoContext(
-			w.ctx, "shadow prewarm forecast; raising nothing",
-			"scale_set", w.scaleSet.Name,
-			"count", forecast)
-	}
 }

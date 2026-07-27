@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -146,12 +147,28 @@ func (r *basePoolManager) createPrewarmRequest(ctx context.Context, job params.J
 		"run_attempt", request.RunAttempt,
 		"trigger_job_id", job.WorkflowJobID,
 		"mode", request.Mode,
-		"outcome", outcome)
+		"outcome", outcome,
+		// The forecast itself, on the one line that fires exactly once per
+		// forecast. In shadow this is the whole output an operator gets from a
+		// rule, so it has to say what was predicted and not merely that
+		// something was.
+		"forecast", formatForecast(targets))
 
 	if created {
 		r.triggerPrewarmReconcile()
 	}
 	return nil
+}
+
+// formatForecast renders a rule's targets as "label=count" pairs, in the order
+// the operator wrote them, so the log line reads like the configuration it came
+// from.
+func formatForecast(targets []params.CreatePrewarmTargetParams) string {
+	pairs := make([]string, 0, len(targets))
+	for _, target := range targets {
+		pairs = append(pairs, fmt.Sprintf("%s=%d", target.LabelKey, target.TargetCount))
+	}
+	return strings.Join(pairs, " ")
 }
 
 func (r *basePoolManager) triggerPrewarmReconcile() {
@@ -225,9 +242,12 @@ func (r *basePoolManager) reconcilePrewarm() error {
 }
 
 // observeShadowForecast publishes what a shadow rule would have prewarmed, and
-// creates nothing. It is the whole of shadow mode's output, so it reports the
-// per-target counts an operator is being asked to compare against the fanout —
-// not just that a forecast happened.
+// creates nothing.
+//
+// Metric only, exactly like the active path. This runs on every reconcile pass,
+// so a log line here would repeat itself every few seconds for the life of the
+// forecast; the forecast is logged once, where it is made, by
+// createPrewarmRequest.
 func (r *basePoolManager) observeShadowForecast(demands []params.PrewarmDemand) {
 	for _, demand := range demands {
 		pool, isPoolTarget, err := r.resolvePrewarmPool(demand)
@@ -243,11 +263,6 @@ func (r *basePoolManager) observeShadowForecast(demands []params.PrewarmDemand) 
 		}
 
 		metrics.PrewarmTargetRunners.WithLabelValues(demand.LabelKey, pool.ID).Set(float64(demand.Remaining))
-		slog.InfoContext(
-			r.ctx, "shadow prewarm forecast; creating nothing",
-			"label_key", demand.LabelKey,
-			"pool_id", pool.ID,
-			"count", demand.Remaining)
 	}
 }
 
