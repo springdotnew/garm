@@ -16,6 +16,7 @@ package scaleset
 
 import (
 	"log/slog"
+	"time"
 
 	"github.com/cloudbase/garm/config"
 	"github.com/cloudbase/garm/metrics"
@@ -49,9 +50,8 @@ func (w *Worker) refreshPrewarmForecastLocked() {
 
 	// Prewarming off is prewarming absent: an operator who never configured it
 	// should not pay two database round trips on every autoscale pass for a
-	// forecast that cannot exist. Only `enable` is checked, not the mode — the
-	// query below already filters to active requests, so shadow mode keeps
-	// exercising exactly the code path it is there to rehearse.
+	// forecast that cannot exist. Mode is checked further down rather than here,
+	// so shadow still walks the same path it is there to rehearse.
 	if !w.prewarm.Enable {
 		return
 	}
@@ -68,6 +68,17 @@ func (w *Worker) refreshPrewarmForecastLocked() {
 		return
 	}
 
+	// Shadow is a dry run, not a blackout. SumRemainingPrewarmForecast excludes
+	// shadow requests deliberately — acting on one would defeat the point — but
+	// that also left the metric reading zero in the only mode whose entire job
+	// is to be read. doc/prewarm.md asks operators to compare
+	// garm_prewarm_target_runners against the fanout that actually queued
+	// before switching a rule on, so publish it here, and still raise nothing.
+	if !w.prewarm.IsActive() {
+		w.publishShadowForecast()
+		return
+	}
+
 	forecast, err := w.store.SumRemainingPrewarmForecast(w.ctx, w.entity.ID, w.prewarmLabelKey())
 	if err != nil {
 		slog.ErrorContext(w.ctx, "error reading prewarm forecast; not prewarming", "error", err)
@@ -79,4 +90,45 @@ func (w *Worker) refreshPrewarmForecastLocked() {
 
 	w.speculativeRunners = int(forecast)
 	metrics.PrewarmTargetRunners.WithLabelValues(w.prewarmLabelKey(), w.consumerID).Set(float64(forecast))
+}
+
+// publishShadowForecast reports what this scale set would have been raised to,
+// without raising it. w.speculativeRunners is left at zero by the caller, so
+// nothing downstream can mistake a rehearsal for demand.
+//
+// The sum is done here rather than in the store because the store's forecast
+// query is the one the autoscaler acts on, and widening it to shadow rows would
+// make a dry run indistinguishable from a live one at exactly the layer that
+// must tell them apart.
+func (w *Worker) publishShadowForecast() {
+	requests, err := w.store.ListActivePrewarmRequests(w.ctx, w.entity.ID)
+	if err != nil {
+		slog.ErrorContext(w.ctx, "error reading the shadow prewarm forecast", "error", err)
+		return
+	}
+
+	labelKey := w.prewarmLabelKey()
+	now := time.Now()
+	forecast := uint(0)
+	for _, request := range requests {
+		if request.IsActive() || !request.ExpiresAt.After(now) {
+			continue
+		}
+		for _, target := range request.Targets {
+			if target.LabelKey == labelKey {
+				forecast += target.RemainingForecast()
+			}
+		}
+	}
+
+	if forecast > w.scaleSet.MaxRunners {
+		forecast = w.scaleSet.MaxRunners
+	}
+	metrics.PrewarmTargetRunners.WithLabelValues(labelKey, w.consumerID).Set(float64(forecast))
+	if forecast > 0 {
+		slog.InfoContext(
+			w.ctx, "shadow prewarm forecast; raising nothing",
+			"scale_set", w.scaleSet.Name,
+			"count", forecast)
+	}
 }

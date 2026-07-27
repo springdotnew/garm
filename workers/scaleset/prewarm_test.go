@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/mock"
 
@@ -44,7 +45,7 @@ func newPrewarmWorker(t *testing.T, scaleSet params.ScaleSet) (*Worker, *dbMocks
 		store:      store,
 		scaleSet:   scaleSet,
 		entity:     params.ForgeEntity{ID: prewarmTestEntityID},
-		prewarm:    config.Prewarm{Enable: true},
+		prewarm:    config.Prewarm{Enable: true, Mode: config.PrewarmModeActive},
 	}, store
 }
 
@@ -193,6 +194,95 @@ func TestDisabledPrewarmQueriesNothing(t *testing.T) {
 
 	if got, want := w.targetRunners(), 0; got != want {
 		t.Fatalf("target runners with prewarm disabled = %d, want %d", got, want)
+	}
+}
+
+// Shadow mode's whole output is the number an operator is supposed to read
+// before switching a rule on. It must be the forecast, not zero.
+func TestShadowForecastIsPublishedWithoutRaisingTheTarget(t *testing.T) {
+	scaleSet := benchScaleSet()
+	scaleSet.DesiredRunnerCount = 1
+	w, store := newPrewarmWorker(t, scaleSet)
+	w.prewarm.Mode = config.PrewarmModeShadow
+
+	store.EXPECT().ControllerInfo().Return(params.ControllerInfo{}, nil).Once()
+	store.EXPECT().
+		ListActivePrewarmRequests(mock.Anything, prewarmTestEntityID).
+		Return([]params.PrewarmRequest{
+			shadowRequest(prewarmTestScaleSet, 7, 2),
+			// A live request for the same scale set proves the two are not
+			// summed together: acting on a shadow forecast is the one thing
+			// shadow mode must never do.
+			activeRequest(prewarmTestScaleSet, 4),
+			// Another scale set's forecast is none of this worker's business.
+			shadowRequest("some-other-scaleset", 30, 0),
+		}, nil).Once()
+
+	w.refreshPrewarmForecastLocked()
+
+	if got, want := w.speculativeRunners, 0; got != want {
+		t.Fatalf("speculative runners in shadow = %d, want %d", got, want)
+	}
+	if got, want := w.targetRunners(), 1; got != want {
+		t.Fatalf("target runners in shadow = %d, want %d", got, want)
+	}
+}
+
+// An expired shadow request describes a window that has closed. Reporting it
+// would tell an operator to size for a fanout that is already over.
+func TestExpiredShadowForecastIsNotPublished(t *testing.T) {
+	w, store := newPrewarmWorker(t, benchScaleSet())
+	w.prewarm.Mode = config.PrewarmModeShadow
+
+	expired := shadowRequest(prewarmTestScaleSet, 9, 0)
+	expired.ExpiresAt = time.Now().Add(-time.Minute)
+
+	store.EXPECT().ControllerInfo().Return(params.ControllerInfo{}, nil).Once()
+	store.EXPECT().
+		ListActivePrewarmRequests(mock.Anything, prewarmTestEntityID).
+		Return([]params.PrewarmRequest{expired}, nil).Once()
+
+	w.refreshPrewarmForecastLocked()
+
+	if got, want := w.targetRunners(), 0; got != want {
+		t.Fatalf("target runners for an expired shadow forecast = %d, want %d", got, want)
+	}
+}
+
+// The forecast is read, not acted on, so a failure to read it costs a number on
+// a dashboard — never the scale set's ordinary target.
+func TestShadowForecastReadFailureLeavesTheOrdinaryTarget(t *testing.T) {
+	scaleSet := benchScaleSet()
+	scaleSet.DesiredRunnerCount = 2
+	w, store := newPrewarmWorker(t, scaleSet)
+	w.prewarm.Mode = config.PrewarmModeShadow
+
+	store.EXPECT().ControllerInfo().Return(params.ControllerInfo{}, nil).Once()
+	store.EXPECT().
+		ListActivePrewarmRequests(mock.Anything, prewarmTestEntityID).
+		Return(nil, errors.New("database is unreachable")).Once()
+
+	w.refreshPrewarmForecastLocked()
+
+	if got, want := w.targetRunners(), 2; got != want {
+		t.Fatalf("target runners after a failed shadow read = %d, want %d", got, want)
+	}
+}
+
+func shadowRequest(labelKey string, target, observed uint) params.PrewarmRequest {
+	request := activeRequest(labelKey, target)
+	request.State = params.PrewarmRequestShadow
+	request.Targets[0].ObservedDemand = observed
+	return request
+}
+
+func activeRequest(labelKey string, target uint) params.PrewarmRequest {
+	return params.PrewarmRequest{
+		State:     params.PrewarmRequestActive,
+		ExpiresAt: time.Now().Add(time.Hour),
+		Targets: []params.PrewarmRequestTarget{
+			{LabelKey: labelKey, TargetCount: target},
+		},
 	}
 }
 

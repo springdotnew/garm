@@ -190,6 +190,14 @@ func (r *basePoolManager) reconcilePrewarm() error {
 		return nil
 	}
 
+	// Shadow forecasts create nothing, but they still have to be visible.
+	// Shadow exists so an operator can compare a rule's forecast against the
+	// fanout that actually queued before switching it on, and doc/prewarm.md
+	// tells them to read garm_prewarm_target_runners to do it. Publishing
+	// nothing for every shadow request makes shadow mode useless for the one
+	// job it has: a dry run nobody can read is a silent one, not a rehearsal.
+	r.observeShadowForecast(aggregatePrewarmDemandInState(requests, shadowRequests))
+
 	// Size every target first, then create for all of them at once.
 	//
 	// Sizing is a few reads and is over in milliseconds; creating is not. Doing
@@ -214,6 +222,33 @@ func (r *basePoolManager) reconcilePrewarm() error {
 	wg.Wait()
 
 	return nil
+}
+
+// observeShadowForecast publishes what a shadow rule would have prewarmed, and
+// creates nothing. It is the whole of shadow mode's output, so it reports the
+// per-target counts an operator is being asked to compare against the fanout —
+// not just that a forecast happened.
+func (r *basePoolManager) observeShadowForecast(demands []params.PrewarmDemand) {
+	for _, demand := range demands {
+		pool, isPoolTarget, err := r.resolvePrewarmPool(demand)
+		if err != nil {
+			slog.With(slog.Any("error", err)).ErrorContext(
+				r.ctx, "failed to resolve a shadow prewarm target",
+				"label_key", demand.LabelKey)
+			continue
+		}
+		if !isPoolTarget {
+			// A scale set target, or another entity's. Its own worker reports it.
+			continue
+		}
+
+		metrics.PrewarmTargetRunners.WithLabelValues(demand.LabelKey, pool.ID).Set(float64(demand.Remaining))
+		slog.InfoContext(
+			r.ctx, "shadow prewarm forecast; creating nothing",
+			"label_key", demand.LabelKey,
+			"pool_id", pool.ID,
+			"count", demand.Remaining)
+	}
 }
 
 // prewarmPlan is one target, already resolved and already sized: how many
@@ -255,17 +290,31 @@ func (r *basePoolManager) planPrewarmTargets(demands []params.PrewarmDemand) []p
 	return plans
 }
 
+// requestSelector picks which of an entity's live requests an aggregation is
+// about. Shadow and active requests are summed the same way and mean different
+// things: one is a plan, the other is a commitment.
+type requestSelector func(params.PrewarmRequest) bool
+
+func activeRequests(request params.PrewarmRequest) bool { return request.IsActive() }
+
+func shadowRequests(request params.PrewarmRequest) bool { return !request.IsActive() }
+
 // aggregatePrewarmDemand sums the remaining forecast of every active request by
 // label set. Overlapping runs add their forecasts, so a second PR opened while
 // the first is still fanning out reuses whatever capacity is already on its way
 // instead of each run sizing itself in isolation.
 func aggregatePrewarmDemand(requests []params.PrewarmRequest) []params.PrewarmDemand {
+	return aggregatePrewarmDemandInState(requests, activeRequests)
+}
+
+func aggregatePrewarmDemandInState(
+	requests []params.PrewarmRequest, selected requestSelector,
+) []params.PrewarmDemand {
 	byLabel := map[string]*params.PrewarmDemand{}
 	order := []string{}
 
 	for _, request := range requests {
-		if !request.IsActive() {
-			// Shadow requests record a forecast but never create capacity.
+		if !selected(request) {
 			continue
 		}
 		for _, target := range request.Targets {
