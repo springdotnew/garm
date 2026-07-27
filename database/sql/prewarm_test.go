@@ -32,6 +32,14 @@ import (
 	"github.com/cloudbase/garm/params"
 )
 
+// spotLabelKey is the label set of the suite's pool. Speculative runners are
+// only ever matched to a pool by label, so most assertions are about this key.
+const spotLabelKey = "gcp-4vcpu-spot"
+
+// largeLabelKey belongs to no pool in this suite. It is the second target of
+// every request, and exists to prove that targets are accounted separately.
+const largeLabelKey = "gcp-8vcpu"
+
 type PrewarmTestSuite struct {
 	suite.Suite
 
@@ -68,7 +76,7 @@ func (s *PrewarmTestSuite) SetupTest() {
 		Flavor:         "test-flavor",
 		OSType:         "linux",
 		OSArch:         "amd64",
-		Tags:           []string{"gcp-4vcpu-spot"},
+		Tags:           []string{spotLabelKey},
 		Enabled:        true,
 	})
 	s.Require().NoError(err)
@@ -93,8 +101,8 @@ func (s *PrewarmTestSuite) createRequestParams() params.CreatePrewarmRequestPara
 		State:        params.PrewarmRequestActive,
 		ExpiresAt:    time.Now().Add(8 * time.Minute),
 		Targets: []params.CreatePrewarmTargetParams{
-			{LabelKey: "gcp-4vcpu-spot", Labels: []string{"gcp-4vcpu-spot"}, TargetCount: 5},
-			{LabelKey: "gcp-8vcpu", Labels: []string{"gcp-8vcpu"}, TargetCount: 2},
+			{LabelKey: spotLabelKey, Labels: []string{spotLabelKey}, TargetCount: 5},
+			{LabelKey: largeLabelKey, Labels: []string{largeLabelKey}, TargetCount: 2},
 		},
 	}
 }
@@ -191,7 +199,7 @@ func (s *PrewarmTestSuite) TestConsumeForecastReducesRemaining() {
 
 	for i := 0; i < 3; i++ {
 		s.Require().NoError(s.store.ConsumePrewarmForecast(
-			s.adminCtx, s.entity.ID, request.RunID, request.RunAttempt, "gcp-4vcpu-spot"))
+			s.adminCtx, s.entity.ID, request.RunID, request.RunAttempt, spotLabelKey))
 	}
 
 	active, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
@@ -200,10 +208,10 @@ func (s *PrewarmTestSuite) TestConsumeForecastReducesRemaining() {
 
 	for _, target := range active[0].Targets {
 		switch target.LabelKey {
-		case "gcp-4vcpu-spot":
+		case spotLabelKey:
 			s.Require().Equal(uint(3), target.ObservedDemand)
 			s.Require().Equal(uint(2), target.RemainingForecast())
-		case "gcp-8vcpu":
+		case largeLabelKey:
 			s.Require().Zero(target.ObservedDemand, "an unrelated label set must not be consumed")
 			s.Require().Equal(uint(2), target.RemainingForecast())
 		}
@@ -218,14 +226,14 @@ func (s *PrewarmTestSuite) TestConsumeForecastFloorsAtZero() {
 
 	for i := 0; i < 12; i++ {
 		s.Require().NoError(s.store.ConsumePrewarmForecast(
-			s.adminCtx, s.entity.ID, request.RunID, request.RunAttempt, "gcp-4vcpu-spot"))
+			s.adminCtx, s.entity.ID, request.RunID, request.RunAttempt, spotLabelKey))
 	}
 
 	active, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
 	s.Require().NoError(err)
 
 	for _, target := range active[0].Targets {
-		if target.LabelKey == "gcp-4vcpu-spot" {
+		if target.LabelKey == spotLabelKey {
 			s.Require().Equal(uint(5), target.ObservedDemand, "observed demand is capped at the target")
 			s.Require().Zero(target.RemainingForecast())
 		}
@@ -244,7 +252,7 @@ func (s *PrewarmTestSuite) TestConcurrentForecastConsumptionDoesNotLoseUpdates()
 		go func() {
 			defer wg.Done()
 			_ = s.store.ConsumePrewarmForecast(
-				s.adminCtx, s.entity.ID, request.RunID, request.RunAttempt, "gcp-4vcpu-spot")
+				s.adminCtx, s.entity.ID, request.RunID, request.RunAttempt, spotLabelKey)
 		}()
 	}
 	wg.Wait()
@@ -252,7 +260,7 @@ func (s *PrewarmTestSuite) TestConcurrentForecastConsumptionDoesNotLoseUpdates()
 	active, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
 	s.Require().NoError(err)
 	for _, target := range active[0].Targets {
-		if target.LabelKey == "gcp-4vcpu-spot" {
+		if target.LabelKey == spotLabelKey {
 			s.Require().Equal(uint(5), target.ObservedDemand)
 		}
 	}
@@ -443,14 +451,14 @@ func (s *PrewarmTestSuite) TestPrewarmCounters() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
 
-	s.Require().NoError(s.store.RecordPrewarmInstancesCreated(s.adminCtx, request.ID, "gcp-4vcpu-spot", 4))
-	s.Require().NoError(s.store.RecordPrewarmInstanceClaimed(s.adminCtx, request.ID, "gcp-4vcpu-spot"))
-	s.Require().NoError(s.store.RecordPrewarmInstancesReaped(s.adminCtx, request.ID, "gcp-4vcpu-spot", 2))
+	s.Require().NoError(s.store.RecordPrewarmInstancesCreated(s.adminCtx, request.ID, spotLabelKey, 4))
+	s.Require().NoError(s.store.RecordPrewarmInstanceClaimed(s.adminCtx, request.ID, spotLabelKey))
+	s.Require().NoError(s.store.RecordPrewarmInstancesReaped(s.adminCtx, request.ID, spotLabelKey, 2))
 
 	active, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
 	s.Require().NoError(err)
 	for _, target := range active[0].Targets {
-		if target.LabelKey == "gcp-4vcpu-spot" {
+		if target.LabelKey == spotLabelKey {
 			s.Require().Equal(uint(4), target.CreatedCount)
 			s.Require().Equal(uint(1), target.ClaimedCount)
 			s.Require().Equal(uint(2), target.ReapedCount)

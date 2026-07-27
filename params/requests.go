@@ -613,6 +613,10 @@ type UpdateControllerParams struct {
 	// for local development and testing only.
 	AllowInsecureGARMAgent *bool `json:"allow_insecure_garm_agent,omitempty"`
 	MinimumJobAgeBackoff   *uint `json:"minimum_job_age_backoff,omitempty"`
+	// PrewarmPaused is the runtime kill switch for speculative prewarming.
+	// Setting it stops speculative runner creation immediately; it does not
+	// change any rule and does not affect scaling for real queued jobs.
+	PrewarmPaused *bool `json:"prewarm_paused,omitempty"`
 	// swagger:strfmt byte
 	CACertBundle      []byte `json:"ca_cert_bundle,omitempty"`
 	ClearCACertBundle *bool  `json:"clear_ca_cert_bundle,omitempty"`

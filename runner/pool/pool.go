@@ -37,6 +37,7 @@ import (
 	"github.com/cloudbase/garm-provider-common/util"
 	"github.com/cloudbase/garm/auth"
 	"github.com/cloudbase/garm/cache"
+	"github.com/cloudbase/garm/config"
 	dbCommon "github.com/cloudbase/garm/database/common"
 	"github.com/cloudbase/garm/database/watcher"
 	garmErrors "github.com/cloudbase/garm/internal/errors"
@@ -128,7 +129,7 @@ func (p *poolReservationLimiter) waitForReservation(
 	}
 }
 
-func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instanceTokenGetter auth.InstanceTokenGetter, providers map[string]common.Provider, store dbCommon.Store) (common.PoolManager, error) {
+func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instanceTokenGetter auth.InstanceTokenGetter, providers map[string]common.Provider, store dbCommon.Store, prewarmCfg config.Prewarm) (common.PoolManager, error) {
 	ctx = garmUtil.WithSlogContext(
 		ctx,
 		slog.Any("pool_mgr", entity.String()),
@@ -191,6 +192,8 @@ func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instan
 		consumer:                consumer,
 		pendingInstancesTrigger: make(chan struct{}, 1),
 		queuedJobsTrigger:       make(chan struct{}, 1),
+		prewarmCfg:              prewarmCfg,
+		prewarmTrigger:          make(chan struct{}, 1),
 	}
 	return repo, nil
 }
@@ -212,6 +215,9 @@ type basePoolManager struct {
 	tools       []commonParams.RunnerApplicationDownload
 	quit        chan struct{}
 	checkedJobs map[int64]time.Time
+
+	prewarmCfg     config.Prewarm
+	prewarmTrigger chan struct{}
 
 	pendingInstancesTrigger  chan struct{}
 	queuedJobsTrigger        chan struct{}
@@ -547,7 +553,10 @@ func (r *basePoolManager) HandleWorkflowJob(job params.WorkflowJob) error {
 
 	switch job.Action {
 	case "queued":
+		// Wake the real queued-job consumer first. A forecast must never be
+		// serviced ahead of the job that produced it.
 		r.triggerQueuedJobsAfterBackoff()
+		r.handlePrewarmForQueuedJob(ctx, jobParams)
 	case "in_progress":
 		triggeredBy, inProgressErr := r.handleInProgressJob(ctx, jobParams)
 		actionErr = inProgressErr
@@ -1114,7 +1123,12 @@ func (r *basePoolManager) setInstanceStatus(runnerName string, status commonPara
 	return instance, nil
 }
 
-func (r *basePoolManager) AddRunner(ctx context.Context, poolID string, aditionalLabels []string) (err error) {
+// AddRunner creates one runner in a pool. A non-nil speculative marks the
+// runner as created from a prewarm forecast; everything else about its
+// lifecycle — JIT registration, provider creation, cleanup — is identical to an
+// ordinary runner, which is the point: speculative capacity is not a second
+// kind of runner, only a differently motivated one.
+func (r *basePoolManager) AddRunner(ctx context.Context, poolID string, aditionalLabels []string, speculative *params.SpeculativeInstanceParams) (err error) {
 	pool, err := r.store.GetEntityPool(r.ctx, r.entity, poolID)
 	if err != nil {
 		return fmt.Errorf("error fetching pool: %w", err)
@@ -1169,6 +1183,13 @@ func (r *basePoolManager) AddRunner(ctx context.Context, poolID string, aditiona
 
 	if runner != nil {
 		createParams.AgentID = runner.GetID()
+	}
+
+	if speculative != nil {
+		createParams.Speculative = true
+		createParams.SpeculativeRequestID = speculative.RequestID
+		expiresAt := speculative.ExpiresAt
+		createParams.SpeculativeExpiresAt = &expiresAt
 	}
 
 	if _, err := r.store.CreateInstance(r.ctx, poolID, createParams); err != nil {
@@ -1446,9 +1467,17 @@ func (r *basePoolManager) scaleDownOnePool(ctx context.Context, pool params.Pool
 		// consideration for scale-down. The 5 minute grace period prevents a situation where a
 		// "queued" workflow triggers the creation of a new idle runner, and this routine reaps
 		// an idle runner before they have a chance to pick up a job.
-		if inst.RunnerStatus == params.RunnerIdle && inst.Status == commonParams.InstanceRunning {
-			idleWorkers = append(idleWorkers, inst)
+		if inst.RunnerStatus != params.RunnerIdle || inst.Status != commonParams.InstanceRunning {
+			continue
 		}
+		// Speculative runners are idle on purpose: they are waiting for a
+		// fanout GitHub has not queued yet. Scaling them down would delete the
+		// very capacity that was just paid for. Once their forecast window
+		// passes, the prewarm reaper — not this loop — removes them.
+		if isLiveSpeculativeRunner(inst) {
+			continue
+		}
+		idleWorkers = append(idleWorkers, inst)
 	}
 
 	if len(idleWorkers) == 0 {
@@ -1529,6 +1558,7 @@ func (r *basePoolManager) addRunnerToPoolConcurrently(
 	pool params.Pool,
 	aditionalLabels []string,
 	limiter *poolReservationLimiter,
+	speculative *params.SpeculativeInstanceParams,
 ) (<-chan struct{}, error) {
 	if !pool.Enabled {
 		return nil, fmt.Errorf("pool %s is disabled", pool.ID)
@@ -1567,7 +1597,7 @@ func (r *basePoolManager) addRunnerToPoolConcurrently(
 		limiter.reservationFinished(pool.ID, reservationSucceeded)
 	}()
 
-	if err := r.AddRunner(r.ctx, pool.ID, aditionalLabels); err != nil {
+	if err := r.AddRunner(r.ctx, pool.ID, aditionalLabels, speculative); err != nil {
 		return nil, fmt.Errorf("failed to add new instance for pool %s: %w", pool.ID, err)
 	}
 	reservationSucceeded = true
@@ -1621,7 +1651,7 @@ func (r *basePoolManager) ensureIdleRunnersForOnePool(pool params.Pool) error {
 		slog.InfoContext(
 			r.ctx, "adding new idle worker to pool",
 			"pool_id", pool.ID)
-		if err := r.AddRunner(r.ctx, pool.ID, nil); err != nil {
+		if err := r.AddRunner(r.ctx, pool.ID, nil, nil); err != nil {
 			return fmt.Errorf("failed to add new instance for pool %s: %w", pool.ID, err)
 		}
 	}
@@ -2126,6 +2156,8 @@ func (r *basePoolManager) Start() error {
 		go r.startLoopForFunction(r.updateTools, common.PoolToolUpdateInterval, "update_tools", true, nil)
 		go r.startLoopForFunction(r.consumeQueuedJobs, common.PoolConsilitationInterval, "job_queue_consumer", false, r.queuedJobsTrigger)
 		go r.startLoopForFunction(r.reconcileStaleJobs, common.PoolStaleJobReconcileInterval, "stale_job_reconciler", false, nil)
+		go r.startLoopForFunction(r.reconcilePrewarm, common.PoolConsilitationInterval, "prewarm_reconciler", false, r.prewarmTrigger)
+		go r.startLoopForFunction(r.reapSpeculativeSurplus, common.PoolReapTimeoutInterval, "prewarm_reaper", false, nil)
 	}()
 	return nil
 }
@@ -2410,6 +2442,14 @@ func (r *basePoolManager) consumeQueuedJobsWithLimiter(reservationLimiter *poolR
 			continue
 		}
 
+		// Capacity forecast for this job may already be booting or idle.
+		// Taking it means the job is served without paying for a cold boot,
+		// and without GARM creating a second runner nobody needs. The job stays
+		// locked by us, exactly as it would after a real reservation.
+		if r.claimSpeculativeRunnerForJob(job, candidates) {
+			continue
+		}
+
 		job := job
 		reservations.Go(func() error {
 			jobLabels := []string{
@@ -2423,7 +2463,7 @@ func (r *basePoolManager) consumeQueuedJobsWithLimiter(reservationLimiter *poolR
 						"pool_id", pool.ID,
 						"job_id", job.WorkflowJobID)
 					startedAt := time.Now()
-					changed, err := r.addRunnerToPoolConcurrently(pool, jobLabels, reservationLimiter)
+					changed, err := r.addRunnerToPoolConcurrently(pool, jobLabels, reservationLimiter, nil)
 					if err != nil {
 						log := slog.With(
 							slog.Any("error", err),

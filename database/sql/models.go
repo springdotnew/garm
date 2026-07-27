@@ -75,6 +75,11 @@ type ControllerInfo struct {
 	// pick up the job. GARM would allow this amount of time for runners to react
 	// before spinning up a new one and potentially having to scale down later.
 	MinimumJobAgeBackoff uint
+
+	// PrewarmPaused is the runtime kill switch for speculative prewarming. It
+	// lives on the controller rather than in configuration so it can be
+	// flipped without a restart and survives one.
+	PrewarmPaused bool
 	// CachedGARMAgentReleases stores the release index fetched from
 	// GARMAgentReleasesURL: the source URL plus the list of releases
 	// (a marshaled util.AgentReleaseIndex).

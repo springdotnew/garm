@@ -26,15 +26,11 @@ import (
 // Minimal model copies for the migration. These are intentionally decoupled
 // from the main models so that future model changes don't break this migration.
 
-type base0007 struct {
+type prewarmRequest0007 struct {
 	ID        uuid.UUID `gorm:"type:uuid;primary_key;"`
 	CreatedAt time.Time
 	UpdatedAt time.Time
 	DeletedAt gorm.DeletedAt `gorm:"index"`
-}
-
-type prewarmRequest0007 struct {
-	base0007
 
 	EntityID   uuid.UUID `gorm:"index:idx_prewarm_request_dedup,unique,priority:1;index:idx_prewarm_request_entity_state,priority:1"`
 	EntityType string
@@ -55,7 +51,10 @@ type prewarmRequest0007 struct {
 func (prewarmRequest0007) TableName() string { return "prewarm_requests" }
 
 type prewarmRequestTarget0007 struct {
-	base0007
+	ID        uuid.UUID `gorm:"type:uuid;primary_key;"`
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	DeletedAt gorm.DeletedAt `gorm:"index"`
 
 	PrewarmRequestID uuid.UUID `gorm:"index:idx_prewarm_target_label,unique,priority:1"`
 	LabelKey         string    `gorm:"index:idx_prewarm_target_label,unique,priority:2"`
@@ -89,6 +88,17 @@ type workflowJob0007 struct {
 
 func (workflowJob0007) TableName() string { return "workflow_jobs" }
 
+// controllerInfosTable is the single row that carries controller-wide runtime
+// switches. Prewarming reads its pause flag on every reconcile, so the column
+// has to exist before the feature can be turned on.
+const controllerInfosTable = "controller_infos"
+
+type controllerInfo0007 struct {
+	PrewarmPaused bool
+}
+
+func (controllerInfo0007) TableName() string { return controllerInfosTable }
+
 func init() {
 	Register(&gormigrate.Migration{
 		ID: "0007_prewarm",
@@ -98,6 +108,7 @@ func init() {
 				&prewarmRequestTarget0007{},
 				&instance0007{},
 				&workflowJob0007{},
+				&controllerInfo0007{},
 			)
 		},
 	})

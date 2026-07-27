@@ -86,6 +86,13 @@ func (p PrewarmRequestTarget) RemainingForecast() uint {
 	return p.TargetCount - p.ObservedDemand
 }
 
+// SpeculativeInstanceParams marks a runner being created as speculative and
+// carries the forecast it belongs to. A nil value means an ordinary runner.
+type SpeculativeInstanceParams struct {
+	RequestID string
+	ExpiresAt time.Time
+}
+
 // CreatePrewarmRequestParams is the deduplicated insert of a matched rule.
 type CreatePrewarmRequestParams struct {
 	EntityID     string

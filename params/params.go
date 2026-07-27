@@ -1207,6 +1207,11 @@ type ControllerInfo struct {
 	// runners to pick up the job before GARM attempts to allocate a new runner, thus avoiding
 	// the need to potentially scale down runners later.
 	MinimumJobAgeBackoff uint `json:"minimum_job_age_backoff,omitempty"`
+	// PrewarmPaused is the runtime kill switch for speculative prewarming.
+	// While set, no speculative runner is created, but rules stay configured
+	// and scaling for real queued jobs is completely unaffected. It takes
+	// effect immediately, without a restart or a config change.
+	PrewarmPaused bool `json:"prewarm_paused,omitempty"`
 	// Version is the version of the GARM controller.
 	Version string `json:"version,omitempty"`
 	// CACertBundle holds a certificate bundle meant to validate the certificate

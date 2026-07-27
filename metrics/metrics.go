@@ -30,6 +30,7 @@ const (
 	metricsWebhookSubsystem      = "webhook"
 	metricsGithubSubsystem       = "github"
 	metricsJobsSubsystem         = "job"
+	metricsPrewarmSubsystem      = "prewarm"
 )
 
 // RegisterMetrics registers all the metrics
@@ -84,6 +85,14 @@ func RegisterMetrics() error {
 		JobStatus,
 		// webhook metrics
 		WebhooksReceived,
+		// speculative prewarming
+		PrewarmRequestsTotal,
+		PrewarmTargetRunners,
+		PrewarmInstancesCreated,
+		PrewarmInstancesClaimed,
+		PrewarmInstancesReaped,
+		PrewarmIdleSeconds,
+		PrewarmReconcileDuration,
 	)
 
 	for _, c := range collectors {
