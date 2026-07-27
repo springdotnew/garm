@@ -80,9 +80,14 @@ and compare `garm_prewarm_target_runners` against what the fanout actually
 queued, then set your counts and switch to `active`.
 
 In shadow the gauge is a report, not a commitment: it carries the per-target
-forecast for every pool and scale set the rule addresses, alongside a
-`shadow prewarm forecast` log line, while no runner is created and no scale-set
-target is raised.
+forecast for every pool and scale set the rule addresses, while no runner is
+created and no scale-set target is raised. Every match also logs its whole
+forecast once, on the line that records it:
+
+```
+prewarm request recorded rule_id=pr-tests run_id=… mode=shadow outcome=created
+  forecast="gcp-2vcpu=17 gcp-2vcpu-arm=2 gcp-4vcpu=81 gcp-8vcpu=10"
+```
 
 Invalid configuration stops the controller from starting, including while
 prewarming is disabled. A typo should surface when you write it, not the first
