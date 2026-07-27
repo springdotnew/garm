@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 
@@ -33,6 +34,7 @@ import (
 	dbCommon "github.com/cloudbase/garm/database/common"
 	garmTesting "github.com/cloudbase/garm/internal/testing"
 	"github.com/cloudbase/garm/locking"
+	"github.com/cloudbase/garm/metrics"
 	"github.com/cloudbase/garm/params"
 	"github.com/cloudbase/garm/runner/common"
 	runnerCommonMocks "github.com/cloudbase/garm/runner/common/mocks"
@@ -370,6 +372,32 @@ func (s *PrewarmPoolTestSuite) TestShadowModeCreatesNoRunners() {
 
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 	s.Empty(s.allInstances(), "shadow mode must not create a single VM")
+}
+
+// Shadow mode exists to be read: an operator compares its forecast against the
+// fanout that actually queued before switching a rule on. A shadow request that
+// publishes nothing is a silent dry run, which is no use to anyone.
+func (s *PrewarmPoolTestSuite) TestShadowModePublishesTheForecastItWouldHaveActedOn() {
+	s.mgr.prewarmCfg = s.prewarmConfig(config.PrewarmModeShadow)
+
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+
+	s.Empty(s.allInstances())
+	s.EqualValues(prewarmTestCohortLen,
+		s.targetRunnersMetric(config.NormalizeLabelKey(prewarmTestLabels), s.pool.ID))
+}
+
+// targetRunnersMetric reads the gauge an operator is told to compare against
+// the real fanout. Read through dto rather than prometheus' testutil, which is
+// not vendored and is not worth vendoring for one assertion.
+func (s *PrewarmPoolTestSuite) targetRunnersMetric(labelKey, poolID string) float64 {
+	s.T().Helper()
+
+	var metric dto.Metric
+	s.Require().NoError(
+		metrics.PrewarmTargetRunners.WithLabelValues(labelKey, poolID).Write(&metric))
+	return metric.GetGauge().GetValue()
 }
 
 func (s *PrewarmPoolTestSuite) TestDisabledPrewarmIsANoOp() {

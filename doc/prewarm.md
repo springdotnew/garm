@@ -79,6 +79,11 @@ would have acted on, and creates nothing. Let it run over a representative day
 and compare `garm_prewarm_target_runners` against what the fanout actually
 queued, then set your counts and switch to `active`.
 
+In shadow the gauge is a report, not a commitment: it carries the per-target
+forecast for every pool and scale set the rule addresses, alongside a
+`shadow prewarm forecast` log line, while no runner is created and no scale-set
+target is raised.
+
 Invalid configuration stops the controller from starting, including while
 prewarming is disabled. A typo should surface when you write it, not the first
 time somebody flips the switch — and a silently disabled forecast is
