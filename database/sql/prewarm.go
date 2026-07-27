@@ -46,6 +46,19 @@ var speculativeClaimableStatuses = []commonParams.InstanceStatus{
 	commonParams.InstanceRunning,
 }
 
+// speculativeClaimableRunnerStatuses are the runner states in which the forge
+// has not yet given the runner work of its own. Provider status alone is not
+// enough: a speculative runner GitHub has already dispatched a job to is
+// `running` on the provider and `active` on the forge, and claiming it hands the
+// claiming job a runner that will never come for it. That job then waits out the
+// full cold path on top of the time already lost, which is worse than never
+// having prewarmed at all.
+var speculativeClaimableRunnerStatuses = []params.RunnerStatus{
+	params.RunnerPending,
+	params.RunnerInstalling,
+	params.RunnerIdle,
+}
+
 // CreatePrewarmRequest inserts a prewarm request and its targets. The insert is
 // deduplicated on (entity, repository, workflow, run, attempt, rule): a
 // duplicate webhook delivery returns the existing request with created=false
@@ -313,8 +326,8 @@ func (s *sqlDatabase) claimOneSpeculativeInstance(poolIDs []uuid.UUID, workflowJ
 	err := s.conn.Transaction(func(tx *gorm.DB) error {
 		var candidate Instance
 		q := tx.Where(
-			"speculative = ? AND reserved_for_workflow_job_id IS NULL AND pool_id IN ? AND status IN ?",
-			true, poolIDs, speculativeClaimableStatuses).
+			"speculative = ? AND reserved_for_workflow_job_id IS NULL AND pool_id IN ? AND status IN ? AND runner_status IN ?",
+			true, poolIDs, speculativeClaimableStatuses, speculativeClaimableRunnerStatuses).
 			// An already booted runner serves the job soonest; among equals,
 			// the oldest runner has had the most time to come up.
 			Order("CASE WHEN runner_status = 'idle' THEN 0 ELSE 1 END, created_at asc").
@@ -348,8 +361,8 @@ func (s *sqlDatabase) claimOneSpeculativeInstance(poolIDs []uuid.UUID, workflowJ
 func (s *sqlDatabase) hasClaimableSpeculativeInstance(poolIDs []uuid.UUID) bool {
 	var count int64
 	q := s.conn.Model(&Instance{}).Where(
-		"speculative = ? AND reserved_for_workflow_job_id IS NULL AND pool_id IN ? AND status IN ?",
-		true, poolIDs, speculativeClaimableStatuses).Count(&count)
+		"speculative = ? AND reserved_for_workflow_job_id IS NULL AND pool_id IN ? AND status IN ? AND runner_status IN ?",
+		true, poolIDs, speculativeClaimableStatuses, speculativeClaimableRunnerStatuses).Count(&count)
 	return q.Error == nil && count > 0
 }
 
@@ -399,8 +412,7 @@ func (s *sqlDatabase) CountPoolAvailableCapacity(_ context.Context, poolID strin
 
 	uncommittedSpeculative := s.conn.
 		Where("speculative = ? AND reserved_for_workflow_job_id IS NULL AND status IN ? AND runner_status IN ?",
-			true, speculativeClaimableStatuses,
-			[]params.RunnerStatus{params.RunnerPending, params.RunnerInstalling, params.RunnerIdle}).
+			true, speculativeClaimableStatuses, speculativeClaimableRunnerStatuses).
 		Or("speculative = ? AND status = ? AND runner_status = ?",
 			false, commonParams.InstanceRunning, params.RunnerIdle)
 

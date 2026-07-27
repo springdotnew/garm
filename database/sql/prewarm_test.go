@@ -453,6 +453,33 @@ func (s *PrewarmTestSuite) TestClaimSpeculativeInstance() {
 	s.Require().True(errors.Is(err, runnerErrors.ErrNotFound))
 }
 
+// Measured on a live benchmark before it was fixed: a job claimed a speculative
+// runner the forge had already dispatched other work to, GARM therefore did not
+// create a runner for it, and the job waited 661 seconds — eight times the worst
+// wait the same fanout saw with prewarming switched off. A runner that is
+// already working is not capacity, whatever the provider says about it.
+func (s *PrewarmTestSuite) TestClaimIgnoresSpeculativeRunnersTheForgeIsAlreadyUsing() {
+	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
+	s.Require().NoError(err)
+
+	expiry := time.Now().Add(8 * time.Minute)
+	taken := s.createSpeculativeInstance("spec-taken", request.ID, expiry)
+	_, err = s.store.UpdateInstance(s.adminCtx, taken.Name, params.UpdateInstanceParams{
+		RunnerStatus: params.RunnerActive,
+	})
+	s.Require().NoError(err)
+
+	_, err = s.store.ClaimSpeculativeInstance(s.adminCtx, []string{s.pool.ID}, 111)
+	s.Require().True(errors.Is(err, runnerErrors.ErrNotFound),
+		"a speculative runner already running a job must never be claimed again")
+
+	// And the pool must not count it as capacity either, or the next forecast
+	// will build a cohort that is short by exactly the runners it cannot use.
+	capacity, err := s.store.CountPoolAvailableCapacity(s.adminCtx, s.pool.ID)
+	s.Require().NoError(err)
+	s.Require().Equal(int64(0), capacity)
+}
+
 func (s *PrewarmTestSuite) TestClaimIgnoresNonSpeculativeInstances() {
 	_, err := s.store.CreateInstance(s.adminCtx, s.pool.ID, params.CreateInstanceParams{
 		Name:         "ordinary-runner",
