@@ -225,7 +225,12 @@ type basePoolManager struct {
 	// garm_prewarm_target_runners series was last raised, so a forecast that
 	// ends is reported as ending instead of being left at its last reading.
 	// Owned by the prewarm reconcile loop, which never runs concurrently with
-	// itself.
+	// itself, so it needs no lock of its own.
+	//
+	// Replacing a manager for an entity starts this empty. The replacement
+	// republishes every series that still resolves, so the only thing that
+	// outlives it is a series for a target that has since stopped resolving at
+	// all — and by then the gauge has lost its subject, not just its value.
 	publishedPrewarmTargets map[prewarmSeries]uint64
 	prewarmPass             uint64
 
