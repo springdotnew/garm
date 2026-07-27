@@ -20,7 +20,10 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	runnerErrors "github.com/cloudbase/garm-provider-common/errors"
 	"github.com/cloudbase/garm/config"
@@ -461,30 +464,58 @@ func (r *basePoolManager) createSpeculativeRunners(pool params.Pool, requestID s
 		"expires_at", demand.ExpiresAt,
 		"count", count)
 
+	// Reserve concurrently, exactly as the queued-job path does. A reservation
+	// is a database round trip, so creating a cohort one runner at a time costs
+	// the cohort its head start: on the bench controller 81 runners took 51.4s
+	// to request, and the last one was asked for 18s after GitHub had already
+	// queued the fanout it was supposed to be waiting for.
+	//
+	// poolReservationLimiter exists for this — it is the same limiter, taking
+	// the same lock, enforcing the same MaxRunners ceiling, that
+	// consumeQueuedJobsWithLimiter fans out over. Sharing its bound keeps one
+	// answer to "how hard may this controller push reservations".
 	limiter := newPoolReservationLimiter()
-	var created int64
+	reservations := &errgroup.Group{}
+	reservations.SetLimit(queuedJobReservationConcurrency)
+
+	var created atomic.Int64
+	var poolFull atomic.Bool
 	for i := int64(0); i < count; i++ {
-		if _, err := r.addRunnerToPoolConcurrently(pool, nil, limiter, speculative); err != nil {
-			// NoCapacity means the pool is at max runners. Every subsequent
-			// attempt in this pass would hit the same wall.
-			if errors.Is(err, runnerErrors.ErrNoCapacity) {
-				slog.InfoContext(
-					r.ctx, "pool is full; prewarm cohort trimmed",
-					"pool_id", pool.ID,
-					"label_key", demand.LabelKey,
-					"created", created,
-					"requested", count)
-				break
+		reservations.Go(func() error {
+			// The pool filled up while this reservation waited for a slot.
+			// Every one still queued behind it would hit the same wall.
+			if poolFull.Load() {
+				return nil
 			}
-			slog.With(slog.Any("error", err)).ErrorContext(
-				r.ctx, "failed to create speculative runner",
-				"pool_id", pool.ID,
-				"label_key", demand.LabelKey)
-			continue
-		}
-		created++
+			if _, err := r.addRunnerToPoolConcurrently(pool, nil, limiter, speculative); err != nil {
+				if errors.Is(err, runnerErrors.ErrNoCapacity) {
+					poolFull.Store(true)
+					return nil
+				}
+				slog.With(slog.Any("error", err)).ErrorContext(
+					r.ctx, "failed to create speculative runner",
+					"pool_id", pool.ID,
+					"label_key", demand.LabelKey)
+				return nil
+			}
+			created.Add(1)
+			return nil
+		})
 	}
-	return created
+	// Every goroutine above returns nil; a cohort that comes up short is a
+	// smaller forecast, not a failure, and the queued-job path is still the
+	// safety net underneath it.
+	_ = reservations.Wait()
+
+	if poolFull.Load() {
+		slog.InfoContext(
+			r.ctx, "pool is full; prewarm cohort trimmed",
+			"pool_id", pool.ID,
+			"label_key", demand.LabelKey,
+			"created", created.Load(),
+			"requested", count)
+	}
+	return created.Load()
 }
 
 // claimSpeculativeRunnerForJob tries to satisfy a queued job from capacity that

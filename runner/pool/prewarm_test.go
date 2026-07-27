@@ -494,6 +494,91 @@ func (s *PrewarmPoolTestSuite) TestGlobalCapBoundsTheCohort() {
 	s.Len(s.speculativeInstances(), 2)
 }
 
+// The runners of one cohort are reserved concurrently, not one after another.
+// Observed rather than timed: a reservation holds its slot across the JIT-config
+// call, so several of those being open at once is only reachable if several
+// reservations are in flight. If they were serialized, one would park and the
+// rest would never arrive.
+func (s *PrewarmPoolTestSuite) TestCohortReservesConcurrently() {
+	const cohort = queuedJobReservationConcurrency
+
+	// Fresh mocks: the suite's own expectations are unlimited, so they would
+	// win over anything registered here.
+	provider := runnerCommonMocks.NewProvider(s.T())
+	provider.On("DisableJITConfig").Return(false).Maybe()
+	s.mgr.providers["test-provider"] = provider
+
+	entered := make(chan struct{}, cohort)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+
+	ghcli := runnerCommonMocks.NewGithubClient(s.T())
+	ghcli.On("GetEntityJITConfig",
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+	).Run(func(mock.Arguments) {
+		entered <- struct{}{}
+		<-release
+	}).Return(map[string]string{"encoded_jit_config": "test"}, nil, nil).Maybe()
+	ghcli.On("RemoveEntityRunner", mock.Anything, mock.Anything).Return(nil).Maybe()
+	s.mgr.ghcli = ghcli
+
+	s.mgr.prewarmCfg.Rules[0].Targets = []config.PrewarmTarget{
+		{Labels: prewarmTestLabels, Count: cohort},
+	}
+
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+
+	reconciled := make(chan error, 1)
+	go func() { reconciled <- s.mgr.reconcilePrewarm() }()
+
+	for held := 0; held < cohort; held++ {
+		select {
+		case <-entered:
+		case <-time.After(10 * time.Second):
+			releaseOnce.Do(func() { close(release) })
+			s.FailNowf("the cohort is reserving serially",
+				"only %d of %d reservations were in flight at once", held, cohort)
+		}
+	}
+	releaseOnce.Do(func() { close(release) })
+	s.Require().NoError(<-reconciled)
+	s.Len(s.speculativeInstances(), cohort)
+}
+
+// MaxRunners is enforced inside poolReservationLimiter, which the cohort now
+// takes from several goroutines at once. A forecast larger than the pool must
+// still stop at the ceiling instead of racing past it.
+func (s *PrewarmPoolTestSuite) TestCohortStopsAtTheMaxRunnersCeiling() {
+	const ceiling = 3
+
+	cappedLabels := []string{"self-hosted", "linux", "capped"}
+	capped, err := s.store.CreateEntityPool(s.adminCtx, s.entity, params.CreatePoolParams{
+		ProviderName:   "test-provider",
+		MaxRunners:     ceiling,
+		MinIdleRunners: 0,
+		Image:          "test-image",
+		Flavor:         "test-flavor",
+		OSType:         "linux",
+		OSArch:         "amd64",
+		Tags:           cappedLabels,
+		Enabled:        true,
+	})
+	s.Require().NoError(err)
+	cache.SetEntityPool(s.entity.ID, capped)
+
+	s.mgr.prewarmCfg.Rules[0].Targets = []config.PrewarmTarget{
+		{Labels: cappedLabels, Count: 4 * ceiling},
+	}
+
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+
+	instances, err := s.store.ListPoolInstances(s.adminCtx, capped.ID, false)
+	s.Require().NoError(err)
+	s.Len(instances, ceiling, "the cohort raced past the pool's MaxRunners")
+}
+
 // Cohorts are created concurrently, one goroutine per target, so the global cap
 // is the one thing that has to be settled before any of them starts. Two targets
 // sizing themselves against the same in-flight count would each take the whole
