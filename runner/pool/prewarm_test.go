@@ -55,10 +55,12 @@ var prewarmTestLabels = []string{"self-hosted", "linux", "x64"}
 type PrewarmPoolTestSuite struct {
 	suite.Suite
 
-	store        dbCommon.Store
-	adminCtx     context.Context
-	entity       params.ForgeEntity
-	pool         params.Pool
+	store          dbCommon.Store
+	adminCtx       context.Context
+	entity         params.ForgeEntity
+	pool           params.Pool
+	controllerInfo params.ControllerInfo
+
 	mgr          *basePoolManager
 	providerMock *runnerCommonMocks.Provider
 	ghcliMock    *runnerCommonMocks.GithubClient
@@ -106,16 +108,32 @@ func (s *PrewarmPoolTestSuite) SetupTest() {
 
 	controllerInfo, err := db.InitController()
 	s.Require().NoError(err)
+	s.controllerInfo = controllerInfo
+
+	s.mgr = s.newPoolManager()
+
+	s.providerMock.On("DisableJITConfig").Return(true).Maybe()
+	s.ghcliMock.On("GetEntityJITConfig",
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything,
+	).Return(map[string]string{}, nil, nil).Maybe()
+	s.ghcliMock.On("RemoveEntityRunner", mock.Anything, mock.Anything).Return(nil).Maybe()
+}
+
+// newPoolManager builds a pool manager over the suite's store. Building a
+// second one is how a test restarts the controller: the same database, and no
+// memory of anything that happened before.
+func (s *PrewarmPoolTestSuite) newPoolManager() *basePoolManager {
+	s.T().Helper()
 
 	backoff, err := locking.NewInstanceDeleteBackoff(context.Background())
 	s.Require().NoError(err)
 
-	s.mgr = &basePoolManager{
+	return &basePoolManager{
 		ctx:                     s.adminCtx,
 		consumerID:              "prewarm-consumer",
-		entity:                  entity,
-		store:                   db,
-		controllerInfo:          controllerInfo,
+		entity:                  s.entity,
+		store:                   s.store,
+		controllerInfo:          s.controllerInfo,
 		providers:               map[string]common.Provider{"test-provider": s.providerMock},
 		jobs:                    make(map[int64]params.Job),
 		checkedJobs:             make(map[int64]time.Time),
@@ -130,12 +148,6 @@ func (s *PrewarmPoolTestSuite) SetupTest() {
 		prewarmTrigger:          make(chan struct{}, 1),
 		prewarmCfg:              s.prewarmConfig(config.PrewarmModeActive),
 	}
-
-	s.providerMock.On("DisableJITConfig").Return(true).Maybe()
-	s.ghcliMock.On("GetEntityJITConfig",
-		mock.Anything, mock.Anything, mock.Anything, mock.Anything,
-	).Return(map[string]string{}, nil, nil).Maybe()
-	s.ghcliMock.On("RemoveEntityRunner", mock.Anything, mock.Anything).Return(nil).Maybe()
 }
 
 func (s *PrewarmPoolTestSuite) TearDownTest() {
@@ -648,6 +660,31 @@ func (s *PrewarmPoolTestSuite) TestGlobalCapBindsAcrossConcurrentTargets() {
 	total, err = s.store.CountSpeculativeInstances(s.adminCtx)
 	s.Require().NoError(err)
 	s.EqualValues(5, total)
+}
+
+// A controller that goes down partway through a cohort must finish it on the
+// way back up, not start it again. Nothing in memory survives the restart, so
+// the only thing standing between a resumed forecast and a doubled bill is that
+// the runners already created count against the pool's capacity.
+func (s *PrewarmPoolTestSuite) TestRestartMidCohortResumesWithoutDuplicating() {
+	// Interrupt the cohort halfway, which is what a controller dying mid-cohort
+	// leaves behind: some runners created, the forecast still asking for all of
+	// them.
+	const interrupted = prewarmTestCohortLen / 2
+	s.mgr.prewarmCfg.MaxSpeculativeRunners = interrupted
+
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+	s.Require().Len(s.speculativeInstances(), interrupted)
+
+	resumed := s.newPoolManager()
+	s.Require().NoError(resumed.reconcilePrewarm())
+	s.Len(s.speculativeInstances(), prewarmTestCohortLen,
+		"the restarted controller re-created runners it already had")
+
+	// And it settles there rather than topping up again on every pass.
+	s.Require().NoError(resumed.reconcilePrewarm())
+	s.Len(s.speculativeInstances(), prewarmTestCohortLen)
 }
 
 func (s *PrewarmPoolTestSuite) TestOverlappingRunsShareCapacity() {
