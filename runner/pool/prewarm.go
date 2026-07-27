@@ -190,7 +190,7 @@ func (r *basePoolManager) triggerPrewarmReconcile() {
 // call for. It runs on the regular consolidation loop and on an explicit wake
 // after a new request is recorded.
 func (r *basePoolManager) reconcilePrewarm() error {
-	if !r.prewarmEnabled() {
+	if !r.prewarmCfg.Enable {
 		return nil
 	}
 
@@ -199,13 +199,23 @@ func (r *basePoolManager) reconcilePrewarm() error {
 		metrics.PrewarmReconcileDuration.Observe(time.Since(startedAt).Seconds())
 	}()
 
+	// The kill switch stops speculation, and the gauge has to say so. A paused
+	// controller is holding nothing open for anyone, so a reading left at the
+	// last forecast would show unmet demand that nothing is on its way to serve
+	// — and would keep showing it until the pause was lifted.
+	if r.controllerInfoSnapshot().PrewarmPaused {
+		r.retireUnpublishedPrewarmTargets()
+		return nil
+	}
+
 	requests, err := r.store.ListActivePrewarmRequests(r.ctx, r.entity.ID)
 	if err != nil {
 		return fmt.Errorf("error listing prewarm requests: %w", err)
 	}
-	if len(requests) == 0 {
-		return nil
-	}
+
+	// One instant for every aggregation below, so the shadow report and the
+	// thing it rehearses can never disagree about which windows are still open.
+	now := time.Now()
 
 	// Shadow forecasts create nothing, but they still have to be visible.
 	// Shadow exists so an operator can compare a rule's forecast against the
@@ -213,7 +223,7 @@ func (r *basePoolManager) reconcilePrewarm() error {
 	// tells them to read garm_prewarm_target_runners to do it. Publishing
 	// nothing for every shadow request makes shadow mode useless for the one
 	// job it has: a dry run nobody can read is a silent one, not a rehearsal.
-	r.observeShadowForecast(aggregatePrewarmDemandInState(requests, shadowRequests))
+	r.observeShadowForecast(aggregatePrewarmDemandInState(requests, shadowRequests, now))
 
 	// Size every target first, then create for all of them at once.
 	//
@@ -226,7 +236,12 @@ func (r *basePoolManager) reconcilePrewarm() error {
 	//
 	// The cap is still allocated sequentially in planPrewarmTargets, so nothing
 	// about how much gets created changes — only when.
-	plans := r.planPrewarmTargets(aggregatePrewarmDemand(requests))
+	plans := r.planPrewarmTargets(aggregatePrewarmDemand(requests, now))
+
+	// Every target still in play has just republished itself. Whatever did not
+	// is over, and has to read as over — including when there were no requests
+	// at all, which is the state a forecast ends in.
+	r.retireUnpublishedPrewarmTargets()
 
 	var wg sync.WaitGroup
 	for _, plan := range plans {
@@ -262,8 +277,47 @@ func (r *basePoolManager) observeShadowForecast(demands []params.PrewarmDemand) 
 			continue
 		}
 
-		metrics.PrewarmTargetRunners.WithLabelValues(demand.LabelKey, pool.ID).Set(float64(demand.Remaining))
+		r.publishPrewarmTarget(demand.LabelKey, pool.ID, demand.Remaining)
 	}
+}
+
+// prewarmSeries identifies one garm_prewarm_target_runners series.
+type prewarmSeries struct {
+	labelKey string
+	poolID   string
+}
+
+// publishPrewarmTarget reports how much of a target's forecast is still unmet,
+// and remembers the series so the pass that stops publishing it can take it
+// back down.
+func (r *basePoolManager) publishPrewarmTarget(labelKey, poolID string, remaining uint) {
+	metrics.PrewarmTargetRunners.WithLabelValues(labelKey, poolID).Set(float64(remaining))
+	r.publishedPrewarmTargets[prewarmSeries{labelKey: labelKey, poolID: poolID}] = r.prewarmPass
+}
+
+// retireUnpublishedPrewarmTargets takes every series this pass did not publish
+// back to zero, and opens the next pass.
+//
+// A gauge is only ever read after the fact, so one that keeps reporting the last
+// thing it saw is worse than one that was never published: it says a forecast is
+// still unmet long after its window closed. doc/prewarm.md asks operators to
+// size a rule by comparing this gauge against the fanout that actually queued,
+// and a reading that never comes down makes that comparison wrong in the
+// direction that buys machines.
+//
+// Retiring by pass rather than resetting the whole vector is deliberate on both
+// counts: the vector is shared with every other entity and with the scale set
+// workers, and zeroing at the top of a pass would let a scrape landing mid-pass
+// read nothing for a forecast that is still live.
+func (r *basePoolManager) retireUnpublishedPrewarmTargets() {
+	for series, pass := range r.publishedPrewarmTargets {
+		if pass == r.prewarmPass {
+			continue
+		}
+		metrics.PrewarmTargetRunners.WithLabelValues(series.labelKey, series.poolID).Set(0)
+		delete(r.publishedPrewarmTargets, series)
+	}
+	r.prewarmPass++
 }
 
 // prewarmPlan is one target, already resolved and already sized: how many
@@ -318,17 +372,26 @@ func shadowRequests(request params.PrewarmRequest) bool { return !request.IsActi
 // label set. Overlapping runs add their forecasts, so a second PR opened while
 // the first is still fanning out reuses whatever capacity is already on its way
 // instead of each run sizing itself in isolation.
-func aggregatePrewarmDemand(requests []params.PrewarmRequest) []params.PrewarmDemand {
-	return aggregatePrewarmDemandInState(requests, activeRequests)
+func aggregatePrewarmDemand(requests []params.PrewarmRequest, now time.Time) []params.PrewarmDemand {
+	return aggregatePrewarmDemandInState(requests, activeRequests, now)
 }
 
 func aggregatePrewarmDemandInState(
-	requests []params.PrewarmRequest, selected requestSelector,
+	requests []params.PrewarmRequest, selected requestSelector, now time.Time,
 ) []params.PrewarmDemand {
 	byLabel := map[string]*params.PrewarmDemand{}
 	order := []string{}
 
 	for _, request := range requests {
+		// ListActivePrewarmRequests returns everything the reaper has not
+		// flipped yet, and the reaper runs on the reap interval while this runs
+		// on the consolidation interval — two orders of magnitude apart. The
+		// window has to be enforced against the clock here rather than trusted
+		// to the row's state, or a forecast outlives itself by minutes and
+		// spends the whole of them buying machines.
+		if !request.ExpiresAt.After(now) {
+			continue
+		}
 		if !selected(request) {
 			continue
 		}
@@ -382,7 +445,7 @@ func (r *basePoolManager) planPrewarmTarget(demand params.PrewarmDemand, claimed
 		return prewarmPlan{}, fmt.Errorf("error counting available capacity: %w", err)
 	}
 
-	metrics.PrewarmTargetRunners.WithLabelValues(demand.LabelKey, pool.ID).Set(float64(demand.Remaining))
+	r.publishPrewarmTarget(demand.LabelKey, pool.ID, demand.Remaining)
 
 	deficit := int64(demand.Remaining) - available
 	if deficit <= 0 {

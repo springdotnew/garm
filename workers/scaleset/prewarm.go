@@ -64,7 +64,12 @@ func (w *Worker) refreshPrewarmForecastLocked() {
 		slog.ErrorContext(w.ctx, "error getting controller info; not prewarming", "error", err)
 		return
 	}
+	// The kill switch stops speculation, and the gauge has to say so. This scale
+	// set is no longer holding anything open — speculativeRunners is already
+	// back to zero above — so a reading left at the last forecast would report
+	// demand that nothing is on its way to serve.
 	if controllerInfo.PrewarmPaused {
+		metrics.PrewarmTargetRunners.WithLabelValues(w.prewarmLabelKey(), w.consumerID).Set(0)
 		return
 	}
 

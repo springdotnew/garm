@@ -194,6 +194,8 @@ func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instan
 		queuedJobsTrigger:       make(chan struct{}, 1),
 		prewarmCfg:              prewarmCfg,
 		prewarmTrigger:          make(chan struct{}, 1),
+
+		publishedPrewarmTargets: make(map[prewarmSeries]uint64),
 	}
 	return repo, nil
 }
@@ -218,6 +220,14 @@ type basePoolManager struct {
 
 	prewarmCfg     config.Prewarm
 	prewarmTrigger chan struct{}
+
+	// publishedPrewarmTargets records the pass on which each
+	// garm_prewarm_target_runners series was last raised, so a forecast that
+	// ends is reported as ending instead of being left at its last reading.
+	// Owned by the prewarm reconcile loop, which never runs concurrently with
+	// itself.
+	publishedPrewarmTargets map[prewarmSeries]uint64
+	prewarmPass             uint64
 
 	pendingInstancesTrigger  chan struct{}
 	queuedJobsTrigger        chan struct{}

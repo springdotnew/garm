@@ -20,10 +20,12 @@ import (
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/mock"
 
 	"github.com/cloudbase/garm/config"
 	dbMocks "github.com/cloudbase/garm/database/common/mocks"
+	"github.com/cloudbase/garm/metrics"
 	"github.com/cloudbase/garm/params"
 )
 
@@ -55,6 +57,20 @@ func benchScaleSet() params.ScaleSet {
 		Enabled:    true,
 		MaxRunners: prewarmTestMaxRunner,
 	}
+}
+
+// targetRunnersMetric reads the gauge an operator is told to compare against
+// the real fanout. Read through dto rather than prometheus' testutil, which is
+// not vendored and is not worth vendoring for one assertion.
+func targetRunnersMetric(t *testing.T, w *Worker) float64 {
+	t.Helper()
+
+	var metric dto.Metric
+	if err := metrics.PrewarmTargetRunners.
+		WithLabelValues(w.prewarmLabelKey(), w.consumerID).Write(&metric); err != nil {
+		t.Fatalf("reading the target runners gauge: %v", err)
+	}
+	return metric.GetGauge().GetValue()
 }
 
 func expectForecast(store *dbMocks.Store, forecast uint) {
@@ -125,6 +141,26 @@ func TestPausedControllerHoldsNoSpeculativeCapacity(t *testing.T) {
 	}
 	store.AssertNotCalled(t, "SumRemainingPrewarmForecast",
 		mock.Anything, mock.Anything, mock.Anything)
+}
+
+// Pausing is meant to be legible: an operator who has just pulled the emergency
+// switch reads the same gauge to confirm it took. One still reporting the last
+// forecast says capacity is on its way that nothing is going to create.
+func TestKillSwitchTakesTheForecastGaugeDown(t *testing.T) {
+	w, store := newPrewarmWorker(t, benchScaleSet())
+	expectForecast(store, 6)
+	w.refreshPrewarmForecastLocked()
+
+	if got, want := targetRunnersMetric(t, w), 6.0; got != want {
+		t.Fatalf("target runners gauge = %v, want %v", got, want)
+	}
+
+	store.EXPECT().ControllerInfo().Return(params.ControllerInfo{PrewarmPaused: true}, nil).Once()
+	w.refreshPrewarmForecastLocked()
+
+	if got := targetRunnersMetric(t, w); got != 0 {
+		t.Fatalf("target runners gauge after pausing = %v, want 0", got)
+	}
 }
 
 // Not prewarming costs a cold boot; prewarming on an unreadable forecast costs

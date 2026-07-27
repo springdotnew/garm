@@ -52,6 +52,16 @@ const (
 // is what makes a speculative runner eligible for the fanout jobs.
 var prewarmTestLabels = []string{"self-hosted", "linux", "x64"}
 
+const (
+	// prewarmTestBriefTTL is the shortest window a test can ask for and still
+	// have the run it is testing happen inside it. A reconcile pass enforces the
+	// window as it reads it, so a TTL shorter than the pass itself is not a fast
+	// test — it is a forecast that was already over before anything looked at
+	// it, which no real configuration can produce.
+	prewarmTestBriefTTL = config.PrewarmTTL("300ms")
+	prewarmTestPastTTL  = 400 * time.Millisecond
+)
+
 type PrewarmPoolTestSuite struct {
 	suite.Suite
 
@@ -147,6 +157,7 @@ func (s *PrewarmPoolTestSuite) newPoolManager() *basePoolManager {
 		queuedJobsTrigger:       make(chan struct{}, 1),
 		prewarmTrigger:          make(chan struct{}, 1),
 		prewarmCfg:              s.prewarmConfig(config.PrewarmModeActive),
+		publishedPrewarmTargets: make(map[prewarmSeries]uint64),
 	}
 }
 
@@ -221,7 +232,7 @@ func (s *PrewarmPoolTestSuite) allInstances() []params.Instance {
 func (s *PrewarmPoolTestSuite) prewarmWithExpiredCohort(jobID, runID int64) []params.Instance {
 	s.T().Helper()
 
-	s.mgr.prewarmCfg.DefaultTTL = config.PrewarmTTL("1ms")
+	s.mgr.prewarmCfg.DefaultTTL = prewarmTestBriefTTL
 	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(jobID, runID)))
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 
@@ -231,7 +242,7 @@ func (s *PrewarmPoolTestSuite) prewarmWithExpiredCohort(jobID, runID int64) []pa
 	for _, instance := range speculative {
 		s.Require().NotNil(instance.SpeculativeExpiresAt)
 	}
-	time.Sleep(5 * time.Millisecond)
+	time.Sleep(prewarmTestPastTTL)
 
 	return speculative
 }
@@ -429,6 +440,71 @@ func (s *PrewarmPoolTestSuite) targetRunnersMetric(labelKey, poolID string) floa
 	return metric.GetGauge().GetValue()
 }
 
+// A forecast whose window has closed is not a forecast. The reconciler runs on
+// the consolidation interval and the reaper — the only thing that flips an
+// expired request out of the list — runs on the reap interval, so between the
+// two there is a window minutes wide in which an expired request still reads as
+// live. Buying machines in it spends real money on a prediction that has
+// already run out.
+func (s *PrewarmPoolTestSuite) TestExpiredForecastCreatesNothing() {
+	s.mgr.prewarmCfg.DefaultTTL = prewarmTestBriefTTL
+
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	time.Sleep(prewarmTestPastTTL)
+
+	requests, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
+	s.Require().NoError(err)
+	s.Require().Len(requests, 1, "the reaper has not run, so the request is still listed as live")
+
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+	s.Empty(s.allInstances())
+}
+
+// The gauge is only ever read after the fact, so one that keeps reporting the
+// last thing it saw is worse than one that was never published: it says a
+// forecast is still unmet long after its window closed. doc/prewarm.md asks
+// operators to size a rule by comparing this gauge against the fanout that
+// actually queued, and a reading that never comes down makes that comparison
+// wrong in the direction that costs money.
+func (s *PrewarmPoolTestSuite) TestForecastGaugeFallsBackToZeroWhenTheWindowCloses() {
+	s.mgr.prewarmCfg = s.prewarmConfig(config.PrewarmModeShadow)
+	s.mgr.prewarmCfg.DefaultTTL = prewarmTestBriefTTL
+	labelKey := config.NormalizeLabelKey(prewarmTestLabels)
+
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+	s.Require().EqualValues(prewarmTestCohortLen, s.targetRunnersMetric(labelKey, s.pool.ID))
+
+	time.Sleep(prewarmTestPastTTL)
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+
+	s.Zero(s.targetRunnersMetric(labelKey, s.pool.ID))
+}
+
+// The row being reaped is the same event as the window closing, one reap
+// interval later, and the gauge has to survive both. Once the request is gone
+// there is nothing left to publish from, which is exactly when a gauge that
+// only ever gets raised is stuck for good.
+func (s *PrewarmPoolTestSuite) TestForecastGaugeFallsBackToZeroOnceTheRequestIsReaped() {
+	s.mgr.prewarmCfg = s.prewarmConfig(config.PrewarmModeShadow)
+	s.mgr.prewarmCfg.DefaultTTL = prewarmTestBriefTTL
+	labelKey := config.NormalizeLabelKey(prewarmTestLabels)
+
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+	s.Require().EqualValues(prewarmTestCohortLen, s.targetRunnersMetric(labelKey, s.pool.ID))
+
+	time.Sleep(prewarmTestPastTTL)
+	s.Require().NoError(s.mgr.reapSpeculativeSurplus())
+
+	requests, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
+	s.Require().NoError(err)
+	s.Require().Empty(requests, "the reaper has flipped the request out of the live list")
+
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+	s.Zero(s.targetRunnersMetric(labelKey, s.pool.ID))
+}
+
 func (s *PrewarmPoolTestSuite) TestDisabledPrewarmIsANoOp() {
 	s.mgr.prewarmCfg = config.Prewarm{}
 
@@ -535,6 +611,30 @@ func (s *PrewarmPoolTestSuite) TestKillSwitchStopsCreationWithoutAConfigChange()
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 	s.Empty(s.allInstances(), "a paused controller must not create speculative capacity")
 	s.True(s.mgr.prewarmCfg.Enable, "the kill switch must not need a config change")
+}
+
+// Pausing is meant to be legible: an operator who has just pulled the emergency
+// switch reads the same gauge to confirm it took. One still reporting the last
+// forecast says capacity is on its way that nothing is going to create.
+func (s *PrewarmPoolTestSuite) TestKillSwitchTakesTheForecastGaugeDown() {
+	labelKey := config.NormalizeLabelKey(prewarmTestLabels)
+
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+	s.Require().EqualValues(prewarmTestCohortLen, s.targetRunnersMetric(labelKey, s.pool.ID))
+
+	paused := true
+	updated, err := s.store.UpdateController(params.UpdateControllerParams{
+		PrewarmPaused: &paused,
+	})
+	s.Require().NoError(err)
+
+	s.mgr.mux.Lock()
+	s.mgr.controllerInfo = updated
+	s.mgr.mux.Unlock()
+
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+	s.Zero(s.targetRunnersMetric(labelKey, s.pool.ID))
 }
 
 func (s *PrewarmPoolTestSuite) TestGlobalCapBoundsTheCohort() {
