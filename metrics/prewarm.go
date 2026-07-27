@@ -58,7 +58,7 @@ var (
 		Namespace: metricsNamespace,
 		Subsystem: metricsPrewarmSubsystem,
 		Name:      "idle_seconds_total",
-		Help:      "Seconds speculative runners spent alive without serving a job",
+		Help:      "Seconds that reaped speculative runners were alive without ever serving a job. This is the cost of a forecast that did not pay off; runners that were claimed are not counted here, because their lifetime was work.",
 	}, []string{"target", "pool"})
 
 	PrewarmReconcileDuration = prometheus.NewHistogram(prometheus.HistogramOpts{

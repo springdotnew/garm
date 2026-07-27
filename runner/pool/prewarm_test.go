@@ -541,6 +541,40 @@ func (s *PrewarmPoolTestSuite) TestReaperNeverRemovesAClaimedRunner() {
 		"a runner a job is waiting on must never be reaped")
 }
 
+// A reap has to be filed under the target the runner was created for. A
+// speculative runner carries no additional labels of its own, so the only
+// honest source for that is the pool it lives in.
+func (s *PrewarmPoolTestSuite) TestReapIsRecordedAgainstItsTarget() {
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+
+	requests, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
+	s.Require().NoError(err)
+	s.Require().Len(requests, 1)
+
+	past := time.Now().Add(-time.Hour)
+	for i := range 2 {
+		_, err := s.store.CreateInstance(s.adminCtx, s.pool.ID, params.CreateInstanceParams{
+			Name:                 fmt.Sprintf("stale-speculative-%d", i),
+			OSType:               "linux",
+			OSArch:               "amd64",
+			Status:               commonParams.InstanceRunning,
+			RunnerStatus:         params.RunnerIdle,
+			Speculative:          true,
+			SpeculativeRequestID: requests[0].ID,
+			SpeculativeExpiresAt: &past,
+		})
+		s.Require().NoError(err)
+	}
+
+	s.Require().NoError(s.mgr.reapSpeculativeSurplus())
+
+	requests, err = s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
+	s.Require().NoError(err)
+	s.Require().Len(requests, 1, "the request window itself has not closed")
+	s.Require().Len(requests[0].Targets, 1)
+	s.EqualValues(2, requests[0].Targets[0].ReapedCount)
+}
+
 // The reaper has to keep working after the kill switch is thrown, otherwise
 // pausing prewarm would strand the runners already in flight.
 func (s *PrewarmPoolTestSuite) TestReaperDrainsAfterThePrewarmIsPaused() {

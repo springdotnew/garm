@@ -447,13 +447,17 @@ func (r *basePoolManager) claimSpeculativeRunnerForJob(job params.Job, candidate
 	}
 	metrics.PrewarmInstancesClaimed.WithLabelValues(labelKey, instance.PoolID).Inc()
 
+	// How long the runner had already been booting when the job arrived is the
+	// head start prewarming bought for this job. It is the number the whole
+	// feature exists to produce, so record it where it can be measured.
 	slog.InfoContext(
 		r.ctx, "queued job claimed a prewarmed runner",
 		"job_id", job.WorkflowJobID,
 		"runner_name", instance.Name,
 		"pool_id", instance.PoolID,
 		"label_key", labelKey,
-		"runner_status", instance.RunnerStatus)
+		"runner_status", instance.RunnerStatus,
+		"head_start_seconds", time.Since(instance.CreatedAt).Seconds())
 	return true
 }
 
@@ -479,16 +483,28 @@ func (r *basePoolManager) reapSpeculativeSurplus() error {
 	}
 
 	for _, instance := range reapable {
-		if instance.PoolID == "" || !r.isEntityPoolID(instance.PoolID) {
+		pool, ok := r.entityPoolForInstance(instance)
+		if !ok {
 			// Another entity's pool manager owns this runner.
 			continue
 		}
+		// The pool's tags are the target this runner was created for. The
+		// runner's own additional labels are not: a speculative runner is
+		// created without any, so reading them here would file every reap
+		// under an empty target.
+		labelKey := poolLabelKey(pool)
+
+		// Everything this runner was alive for was wasted: it never served a
+		// job. That is the price of a forecast that did not pay off, and it is
+		// only honest to publish it next to the wins.
+		idleSeconds := time.Since(instance.CreatedAt).Seconds()
 
 		slog.InfoContext(
 			r.ctx, "reaping unclaimed speculative runner",
 			"runner_name", instance.Name,
 			"pool_id", instance.PoolID,
 			"request_id", instance.SpeculativeRequestID,
+			"idle_seconds", idleSeconds,
 			"reason", "expired")
 
 		if err := r.DeleteRunner(instance, false, false); err != nil {
@@ -498,7 +514,6 @@ func (r *basePoolManager) reapSpeculativeSurplus() error {
 			continue
 		}
 
-		labelKey := config.NormalizeLabelKey(instance.AditionalLabels)
 		if instance.SpeculativeRequestID != "" {
 			if err := r.store.RecordPrewarmInstancesReaped(
 				r.ctx, instance.SpeculativeRequestID, labelKey, 1); err != nil {
@@ -508,6 +523,7 @@ func (r *basePoolManager) reapSpeculativeSurplus() error {
 			}
 		}
 		metrics.PrewarmInstancesReaped.WithLabelValues(labelKey, instance.PoolID, "expired").Inc()
+		metrics.PrewarmIdleSeconds.WithLabelValues(labelKey, instance.PoolID).Add(idleSeconds)
 	}
 
 	return nil
@@ -526,10 +542,27 @@ func isLiveSpeculativeRunner(instance params.Instance) bool {
 	return instance.SpeculativeExpiresAt.After(time.Now())
 }
 
-func (r *basePoolManager) isEntityPoolID(poolID string) bool {
-	pool, err := r.store.GetPoolByID(r.ctx, poolID)
-	if err != nil {
-		return false
+// entityPoolForInstance returns the pool a runner belongs to, and false when it
+// belongs to a pool this manager does not own.
+func (r *basePoolManager) entityPoolForInstance(instance params.Instance) (params.Pool, bool) {
+	if instance.PoolID == "" {
+		return params.Pool{}, false
 	}
-	return r.isEntityPool(pool)
+	pool, err := r.store.GetPoolByID(r.ctx, instance.PoolID)
+	if err != nil {
+		return params.Pool{}, false
+	}
+	if !r.isEntityPool(pool) {
+		return params.Pool{}, false
+	}
+	return pool, true
+}
+
+// poolLabelKey is the forecast target a pool serves.
+func poolLabelKey(pool params.Pool) string {
+	labels := make([]string, 0, len(pool.Tags))
+	for _, tag := range pool.Tags {
+		labels = append(labels, tag.Name)
+	}
+	return config.NormalizeLabelKey(labels)
 }
