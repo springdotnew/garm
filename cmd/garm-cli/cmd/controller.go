@@ -181,6 +181,10 @@ available upstream can be listed with "garm-cli controller tools list --online".
 			params.MinimumJobAgeBackoff = &minimumJobAgeBackoff
 		}
 
+		if cmd.Flags().Changed("prewarm-paused") {
+			params.PrewarmPaused = &prewarmPaused
+		}
+
 		updateUrlsReq := apiClientController.NewUpdateControllerParams()
 		updateUrlsReq.Body = params
 
@@ -647,6 +651,7 @@ func renderControllerInfoTable(info params.ControllerInfo) string {
 	t.AppendRow(table.Row{"GARM agent version", agentVersion})
 	t.AppendRow(table.Row{"Allow insecure agent", info.AllowInsecureGARMAgent})
 	t.AppendRow(table.Row{"Minimum Job Age Backoff", info.MinimumJobAgeBackoff})
+	t.AppendRow(table.Row{"Prewarm Paused", info.PrewarmPaused})
 	t.AppendRow(table.Row{"Version", serverVersion})
 	if len(info.CACertBundle) > 0 {
 		t.AppendRow(table.Row{"CA Cert Bundle", string(info.CACertBundle)})
@@ -673,6 +678,7 @@ func init() {
 	controllerUpdateCmd.Flags().BoolVarP(&enableToolsSync, "enable-tools-sync", "s", false, "Enable or disable automatic garm tools sync.")
 	controllerUpdateCmd.Flags().BoolVar(&allowInsecureAgent, "allow-insecure-agent", false, "Configure deployed garm-agents to connect to GARM over plain http/ws (force_insecure). The agent token is sent in plain text; meant for local development and testing only.")
 	controllerUpdateCmd.Flags().UintVarP(&minimumJobAgeBackoff, "minimum-job-age-backoff", "b", 0, "The minimum job age backoff for the controller")
+	controllerUpdateCmd.Flags().BoolVar(&prewarmPaused, "prewarm-paused", false, "Pause speculative prewarming. Takes effect immediately, without a restart or a config change. Configured rules are left alone, and scaling for real queued jobs is unaffected.")
 	controllerUpdateCmd.Flags().StringVar(&controllerCABundle, "ca-bundle", "", "A CA bundle that will be used by GARM and the runners to validate HTTPS connections.")
 	controllerUpdateCmd.Flags().BoolVar(&clearCABundle, "clear-ca-bundle", false, "Remove the currently configured CA bundle from the controller.")
 	controllerUpdateCmd.MarkFlagsMutuallyExclusive("ca-bundle", "clear-ca-bundle")
