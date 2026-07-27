@@ -89,7 +89,7 @@ func (c *Controller) createScaleSetWorker(scaleSet params.ScaleSet) (*Worker, er
 		return nil, fmt.Errorf("provider %s not found for scale set %s", scaleSet.ProviderName, scaleSet.Name)
 	}
 
-	worker, err := NewWorker(c.ctx, c.store, scaleSet, provider)
+	worker, err := NewWorker(c.ctx, c.store, scaleSet, provider, c.prewarm)
 	if err != nil {
 		return nil, fmt.Errorf("creating scale set worker: %w", err)
 	}

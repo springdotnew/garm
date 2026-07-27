@@ -47,6 +47,15 @@ func (w *Worker) prewarmLabelKey() string {
 func (w *Worker) refreshPrewarmForecastLocked() {
 	w.speculativeRunners = 0
 
+	// Prewarming off is prewarming absent: an operator who never configured it
+	// should not pay two database round trips on every autoscale pass for a
+	// forecast that cannot exist. Only `enable` is checked, not the mode — the
+	// query below already filters to active requests, so shadow mode keeps
+	// exercising exactly the code path it is there to rehearse.
+	if !w.prewarm.Enable {
+		return
+	}
+
 	// Read through to the store rather than the value cached at construction:
 	// the pause flag is a kill switch, and a kill switch that needs a restart
 	// is not one.

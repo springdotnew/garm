@@ -26,6 +26,7 @@ import (
 	commonParams "github.com/cloudbase/garm-provider-common/params"
 	"github.com/cloudbase/garm-provider-common/util"
 	"github.com/cloudbase/garm/cache"
+	"github.com/cloudbase/garm/config"
 	dbCommon "github.com/cloudbase/garm/database/common"
 	"github.com/cloudbase/garm/database/watcher"
 	garmErrors "github.com/cloudbase/garm/internal/errors"
@@ -41,7 +42,7 @@ const (
 	scaleDownIdleGrace           = 30 * time.Second
 )
 
-func NewWorker(ctx context.Context, store dbCommon.Store, scaleSet params.ScaleSet, provider common.Provider) (*Worker, error) {
+func NewWorker(ctx context.Context, store dbCommon.Store, scaleSet params.ScaleSet, provider common.Provider, prewarm config.Prewarm) (*Worker, error) {
 	consumerID := fmt.Sprintf("scaleset-worker-%s-%d", scaleSet.Name, scaleSet.ID)
 	controllerInfo, err := store.ControllerInfo()
 	if err != nil {
@@ -67,6 +68,7 @@ func NewWorker(ctx context.Context, store dbCommon.Store, scaleSet params.ScaleS
 		provider:        provider,
 		scaleSet:        scaleSet,
 		entity:          entity,
+		prewarm:         prewarm,
 		runners:         make(map[string]params.Instance),
 		runnerSnapshots: make(map[string]time.Time),
 		autoScaleWake:   make(chan struct{}, 1),
@@ -82,6 +84,7 @@ type Worker struct {
 	store    dbCommon.Store
 	scaleSet params.ScaleSet
 	entity   params.ForgeEntity
+	prewarm  config.Prewarm
 	runners  map[string]params.Instance
 	// runnerSnapshots records the newest database timestamp observed for each
 	// runner, including runners removed from the cache. Instance watcher

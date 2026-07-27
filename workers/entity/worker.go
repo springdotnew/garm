@@ -23,6 +23,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/cloudbase/garm/cache"
+	"github.com/cloudbase/garm/config"
 	dbCommon "github.com/cloudbase/garm/database/common"
 	"github.com/cloudbase/garm/database/watcher"
 	"github.com/cloudbase/garm/params"
@@ -34,7 +35,7 @@ import (
 	"github.com/cloudbase/garm/workers/scaleset"
 )
 
-func NewWorker(ctx context.Context, store dbCommon.Store, entity params.ForgeEntity, providers map[string]common.Provider) (*Worker, error) {
+func NewWorker(ctx context.Context, store dbCommon.Store, entity params.ForgeEntity, providers map[string]common.Provider, prewarm config.Prewarm) (*Worker, error) {
 	consumerID := fmt.Sprintf("entity-worker-%s", entity.ID)
 
 	ctx = garmUtil.WithSlogContext(
@@ -47,6 +48,7 @@ func NewWorker(ctx context.Context, store dbCommon.Store, entity params.ForgeEnt
 		store:      store,
 		Entity:     entity,
 		providers:  providers,
+		prewarm:    prewarm,
 	}, nil
 }
 
@@ -60,6 +62,7 @@ type Worker struct {
 
 	Entity             params.ForgeEntity
 	providers          map[string]common.Provider
+	prewarm            config.Prewarm
 	scaleSetController *scaleset.Controller
 
 	eventQueue *workersCommon.UnboundedChan[dbCommon.ChangePayload]
@@ -125,7 +128,7 @@ func (w *Worker) Start() (err error) {
 	w.ghCli = ghCli
 	cache.SetGithubClient(w.Entity.ID, ghCli)
 
-	scaleSetController, err := scaleset.NewController(w.ctx, w.store, w.Entity, w.providers)
+	scaleSetController, err := scaleset.NewController(w.ctx, w.store, w.Entity, w.providers, w.prewarm)
 	if err != nil {
 		return fmt.Errorf("creating scale set controller: %w", err)
 	}

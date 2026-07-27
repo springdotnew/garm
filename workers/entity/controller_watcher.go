@@ -144,7 +144,7 @@ func (c *Controller) handleWatcherUpdateOperation(entity params.ForgeEntity) {
 }
 
 func (c *Controller) handleWatcherCreateOperation(entity params.ForgeEntity) {
-	worker, err := NewWorker(c.ctx, c.store, entity, c.providers)
+	worker, err := NewWorker(c.ctx, c.store, entity, c.providers, c.prewarm)
 	if err != nil {
 		slog.ErrorContext(c.ctx, "creating worker from repository", "entity_type", entity.EntityType, "error", err)
 		return

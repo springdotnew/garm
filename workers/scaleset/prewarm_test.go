@@ -21,6 +21,7 @@ import (
 
 	"github.com/stretchr/testify/mock"
 
+	"github.com/cloudbase/garm/config"
 	dbMocks "github.com/cloudbase/garm/database/common/mocks"
 	"github.com/cloudbase/garm/params"
 )
@@ -43,6 +44,7 @@ func newPrewarmWorker(t *testing.T, scaleSet params.ScaleSet) (*Worker, *dbMocks
 		store:      store,
 		scaleSet:   scaleSet,
 		entity:     params.ForgeEntity{ID: prewarmTestEntityID},
+		prewarm:    config.Prewarm{Enable: true},
 	}, store
 }
 
@@ -177,6 +179,20 @@ func TestExpiredForecastReleasesTheTarget(t *testing.T) {
 	w.refreshPrewarmForecastLocked()
 	if got, want := w.targetRunners(), 1; got != want {
 		t.Fatalf("target runners after the window closed = %d, want %d", got, want)
+	}
+}
+
+// An operator who never turned prewarming on must not pay for it. The mocked
+// store is strict, so any query at all fails this test rather than merely
+// costing a round trip in production.
+func TestDisabledPrewarmQueriesNothing(t *testing.T) {
+	w, _ := newPrewarmWorker(t, benchScaleSet())
+	w.prewarm = config.Prewarm{}
+
+	w.refreshPrewarmForecastLocked()
+
+	if got, want := w.targetRunners(), 0; got != want {
+		t.Fatalf("target runners with prewarm disabled = %d, want %d", got, want)
 	}
 }
 
