@@ -247,32 +247,35 @@ func TestLinuxInstallWrapperRunsConcurrentBootstrapOnce(t *testing.T) {
 	}
 
 	tempDir := t.TempDir()
-	binDir := filepath.Join(tempDir, "bin")
-	if err := os.Mkdir(binDir, 0o755); err != nil {
-		t.Fatalf("failed to create bin directory: %v", err)
-	}
 	countPath := filepath.Join(tempDir, "install-count")
-	fakeCurl := filepath.Join(binDir, "curl")
-	fakeCurlScript := `#!/bin/bash
-set -e
-output=
-while (( $# > 0 )); do
-	if [[ "$1" == "-o" ]]; then
-		output="$2"
-		shift 2
-		continue
-	fi
-	shift
-done
-cat > "$output" <<'EOF'
+
+	// The download is intercepted with a shell function sourced through BASH_ENV
+	// rather than a curl shadowed onto PATH. Bash reads BASH_ENV for exactly the
+	// non-interactive invocation below, and the wrapper calls curl plainly — in a
+	// command substitution, which is still this shell — so a function reaches it.
+	// The alternative, an executable fixture, is the only file this suite would
+	// have to write with an exec bit set.
+	stubPath := filepath.Join(tempDir, "curl-stub.bash")
+	curlStub := `curl() {
+	local output=
+	while (( $# > 0 )); do
+		if [[ "$1" == "-o" ]]; then
+			output="$2"
+			shift 2
+			continue
+		fi
+		shift
+	done
+	cat > "$output" <<'EOF'
 #!/bin/bash
 printf 'run\n' >> "$RUN_COUNT_FILE"
 sleep 0.2
 EOF
-printf 200
+	printf 200
+}
 `
-	if err := os.WriteFile(fakeCurl, []byte(fakeCurlScript), 0o755); err != nil {
-		t.Fatalf("failed to write fake curl: %v", err)
+	if err := os.WriteFile(stubPath, []byte(curlStub), 0o600); err != nil {
+		t.Fatalf("failed to write curl stub: %v", err)
 	}
 
 	rendered := strings.NewReplacer(
@@ -281,14 +284,14 @@ printf 200
 		"/tmp/real-install.sh", filepath.Join(tempDir, "install.sh"),
 	).Replace(string(wrapper))
 	wrapperPath := filepath.Join(tempDir, "wrapper.sh")
-	if err := os.WriteFile(wrapperPath, []byte(rendered), 0o755); err != nil {
+	if err := os.WriteFile(wrapperPath, []byte(rendered), 0o600); err != nil {
 		t.Fatalf("failed to write wrapper: %v", err)
 	}
 
 	run := func() error {
 		cmd := exec.CommandContext(context.Background(), "bash", wrapperPath)
 		cmd.Env = append(os.Environ(),
-			"PATH="+binDir+":"+os.Getenv("PATH"),
+			"BASH_ENV="+stubPath,
 			"RUN_COUNT_FILE="+countPath,
 		)
 		return cmd.Run()

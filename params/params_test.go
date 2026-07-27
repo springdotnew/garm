@@ -17,8 +17,9 @@ package params
 import (
 	"testing"
 
-	commonParams "github.com/cloudbase/garm-provider-common/params"
 	"github.com/stretchr/testify/require"
+
+	commonParams "github.com/cloudbase/garm-provider-common/params"
 )
 
 func TestCreatingInstanceCanPreserveCompletedJobDeletionIntent(t *testing.T) {

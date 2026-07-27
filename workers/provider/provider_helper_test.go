@@ -17,12 +17,13 @@ import (
 	"context"
 	"testing"
 
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+
 	runnerErrors "github.com/cloudbase/garm-provider-common/errors"
 	commonParams "github.com/cloudbase/garm-provider-common/params"
 	dbMocks "github.com/cloudbase/garm/database/common/mocks"
 	"github.com/cloudbase/garm/params"
-	"github.com/stretchr/testify/mock"
-	"github.com/stretchr/testify/require"
 )
 
 func TestUpdateArgsFromProviderInstancePreservesDeletionIntent(t *testing.T) {
