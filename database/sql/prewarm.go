@@ -175,18 +175,36 @@ func (s *sqlDatabase) SumRemainingPrewarmForecast(_ context.Context, entityID, l
 		return 0, fmt.Errorf("error parsing entity id: %w", err)
 	}
 
+	// Resolve the live requests first and sum their targets by id, rather than
+	// joining the two tables. GARM types primary keys `uuid` and foreign keys as
+	// plain strings, so postgres refuses to compare prewarm_requests.id with
+	// prewarm_request_targets.prewarm_request_id in a join predicate — there is
+	// no parameter for it to infer a type from. Matching on a list of ids keeps
+	// every comparison parameterised, which is what the rest of this file does.
+	var requests []PrewarmRequest
+	q := s.conn.Model(&PrewarmRequest{}).
+		Where("entity_id = ? AND state = ?", asUUID, string(params.PrewarmRequestActive)).
+		Where("expires_at > ?", time.Now()).
+		Find(&requests)
+	if q.Error != nil {
+		return 0, fmt.Errorf("error looking up prewarm requests: %w", q.Error)
+	}
+	if len(requests) == 0 {
+		return 0, nil
+	}
+
+	ids := make([]uuid.UUID, 0, len(requests))
+	for _, request := range requests {
+		ids = append(ids, request.ID)
+	}
+
 	// Rows where demand has caught up with the target are filtered out rather
 	// than clamped, which keeps the sum non-negative without a per-row MAX()
 	// that sqlite and postgres spell differently.
 	var remaining sql.NullInt64
-	q := s.conn.Model(&PrewarmRequestTarget{}).
-		Joins("JOIN prewarm_requests ON prewarm_requests.id = prewarm_request_targets.prewarm_request_id").
-		Where("prewarm_requests.entity_id = ? AND prewarm_requests.state = ? AND prewarm_requests.deleted_at IS NULL",
-			asUUID, string(params.PrewarmRequestActive)).
-		Where("prewarm_requests.expires_at > ?", time.Now()).
-		Where("prewarm_request_targets.label_key = ? AND prewarm_request_targets.observed_demand < prewarm_request_targets.target_count",
-			labelKey).
-		Select("SUM(prewarm_request_targets.target_count - prewarm_request_targets.observed_demand)").
+	q = s.conn.Model(&PrewarmRequestTarget{}).
+		Where("prewarm_request_id IN ? AND label_key = ? AND observed_demand < target_count", ids, labelKey).
+		Select("SUM(target_count - observed_demand)").
 		Scan(&remaining)
 	if q.Error != nil {
 		return 0, fmt.Errorf("error summing prewarm forecast: %w", q.Error)
