@@ -554,6 +554,50 @@ func (s *PrewarmPoolTestSuite) TestReaperDrainsAfterThePrewarmIsPaused() {
 	}
 }
 
+// A scale set target looks like this from the pool manager: a label set no
+// pool serves. Its own worker owns it, so this must be a quiet skip rather than
+// a failure that shows up as an error on every reconcile.
+func (s *PrewarmPoolTestSuite) TestTargetThatAddressesNoPoolIsLeftToItsOwner() {
+	cfg := s.prewarmConfig(config.PrewarmModeActive)
+	cfg.Rules[0].Targets = []config.PrewarmTarget{
+		{Labels: []string{"bench-scaleset"}, Count: prewarmTestCohortLen},
+	}
+	s.mgr.prewarmCfg = cfg
+
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+
+	requests, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
+	s.Require().NoError(err)
+	s.Require().Len(requests, 1, "the forecast is still recorded for whoever serves it")
+
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+	s.Empty(s.allInstances(), "the pool manager must not invent a pool for it")
+}
+
+// Putting runners somewhere the operator did not choose is worse than not
+// prewarming, so an ambiguous target is refused rather than guessed.
+func (s *PrewarmPoolTestSuite) TestAmbiguousTargetIsRefused() {
+	_, err := s.store.CreateEntityPool(s.adminCtx, s.entity, params.CreatePoolParams{
+		ProviderName:   "test-provider",
+		MaxRunners:     10,
+		MinIdleRunners: 0,
+		Image:          "other-image",
+		Flavor:         "other-flavor",
+		OSType:         "linux",
+		OSArch:         "amd64",
+		Tags:           prewarmTestLabels,
+		Enabled:        true,
+	})
+	s.Require().NoError(err)
+
+	_, resolved, err := s.mgr.resolvePrewarmPool(params.PrewarmDemand{
+		LabelKey: config.NormalizeLabelKey(prewarmTestLabels),
+		Labels:   prewarmTestLabels,
+	})
+	s.Require().Error(err)
+	s.False(resolved)
+}
+
 func (s *PrewarmPoolTestSuite) TestUnknownWorkflowIsNotPrewarmed() {
 	s.Require().NoError(s.mgr.HandleWorkflowJob(
 		s.workflowJob(1, 100, prewarmTestGateJob, "Some Other Workflow")))

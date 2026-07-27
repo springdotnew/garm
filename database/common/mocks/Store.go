@@ -6272,6 +6272,64 @@ func (_c *Store_SetScaleSetLastMessageID_Call) RunAndReturn(run func(context.Con
 	return _c
 }
 
+// SumRemainingPrewarmForecast provides a mock function with given fields: ctx, entityID, labelKey
+func (_m *Store) SumRemainingPrewarmForecast(ctx context.Context, entityID string, labelKey string) (uint, error) {
+	ret := _m.Called(ctx, entityID, labelKey)
+
+	if len(ret) == 0 {
+		panic("no return value specified for SumRemainingPrewarmForecast")
+	}
+
+	var r0 uint
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, string, string) (uint, error)); ok {
+		return rf(ctx, entityID, labelKey)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, string, string) uint); ok {
+		r0 = rf(ctx, entityID, labelKey)
+	} else {
+		r0 = ret.Get(0).(uint)
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, string, string) error); ok {
+		r1 = rf(ctx, entityID, labelKey)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// Store_SumRemainingPrewarmForecast_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'SumRemainingPrewarmForecast'
+type Store_SumRemainingPrewarmForecast_Call struct {
+	*mock.Call
+}
+
+// SumRemainingPrewarmForecast is a helper method to define mock.On call
+//   - ctx context.Context
+//   - entityID string
+//   - labelKey string
+func (_e *Store_Expecter) SumRemainingPrewarmForecast(ctx interface{}, entityID interface{}, labelKey interface{}) *Store_SumRemainingPrewarmForecast_Call {
+	return &Store_SumRemainingPrewarmForecast_Call{Call: _e.mock.On("SumRemainingPrewarmForecast", ctx, entityID, labelKey)}
+}
+
+func (_c *Store_SumRemainingPrewarmForecast_Call) Run(run func(ctx context.Context, entityID string, labelKey string)) *Store_SumRemainingPrewarmForecast_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(string), args[2].(string))
+	})
+	return _c
+}
+
+func (_c *Store_SumRemainingPrewarmForecast_Call) Return(_a0 uint, _a1 error) *Store_SumRemainingPrewarmForecast_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *Store_SumRemainingPrewarmForecast_Call) RunAndReturn(run func(context.Context, string, string) (uint, error)) *Store_SumRemainingPrewarmForecast_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // UnlockJob provides a mock function with given fields: ctx, jobID, entityID
 func (_m *Store) UnlockJob(ctx context.Context, jobID int64, entityID string) error {
 	ret := _m.Called(ctx, jobID, entityID)

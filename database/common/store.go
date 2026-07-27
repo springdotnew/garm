@@ -229,6 +229,10 @@ type PrewarmStore interface {
 	// duplicate webhook delivery gets false and the existing cohort.
 	CreatePrewarmRequest(ctx context.Context, param params.CreatePrewarmRequestParams) (params.PrewarmRequest, bool, error)
 	ListActivePrewarmRequests(ctx context.Context, entityID string) ([]params.PrewarmRequest, error)
+	// SumRemainingPrewarmForecast returns how much forecast for a label set is
+	// still unmet across an entity's live requests. Scale sets converge on a
+	// runner count rather than reserving per job, so this is all they need.
+	SumRemainingPrewarmForecast(ctx context.Context, entityID, labelKey string) (uint, error)
 	// ConsumePrewarmForecast records one unit of real queued demand against a
 	// run's forecast for a label set.
 	ConsumePrewarmForecast(ctx context.Context, entityID string, workflowJobID, runID, runAttempt int64, labelKey string) error

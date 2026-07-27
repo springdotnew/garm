@@ -361,6 +361,76 @@ func (s *PrewarmTestSuite) TestUnknownJobConsumesNothing() {
 	}
 }
 
+// Scale sets converge on a runner count rather than reserving per job, so the
+// only thing they need from a forecast is how much of it is still unmet.
+func (s *PrewarmTestSuite) TestSumRemainingPrewarmForecast() {
+	remaining, err := s.store.SumRemainingPrewarmForecast(s.adminCtx, s.entity.ID, spotLabelKey)
+	s.Require().NoError(err)
+	s.Require().Zero(remaining, "no forecast means no speculative capacity")
+
+	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
+	s.Require().NoError(err)
+
+	remaining, err = s.store.SumRemainingPrewarmForecast(s.adminCtx, s.entity.ID, spotLabelKey)
+	s.Require().NoError(err)
+	s.Require().Equal(uint(5), remaining)
+
+	// Overlapping runs add their forecasts for the same label set.
+	second := s.createRequestParams()
+	second.RunID = request.RunID + 1
+	_, _, err = s.store.CreatePrewarmRequest(s.adminCtx, second)
+	s.Require().NoError(err)
+
+	remaining, err = s.store.SumRemainingPrewarmForecast(s.adminCtx, s.entity.ID, spotLabelKey)
+	s.Require().NoError(err)
+	s.Require().Equal(uint(10), remaining)
+
+	// Real demand shrinks it.
+	s.Require().NoError(s.consume(901, request, spotLabelKey))
+	remaining, err = s.store.SumRemainingPrewarmForecast(s.adminCtx, s.entity.ID, spotLabelKey)
+	s.Require().NoError(err)
+	s.Require().Equal(uint(9), remaining)
+
+	// A different label set is accounted separately.
+	remaining, err = s.store.SumRemainingPrewarmForecast(s.adminCtx, s.entity.ID, largeLabelKey)
+	s.Require().NoError(err)
+	s.Require().Equal(uint(4), remaining)
+}
+
+func (s *PrewarmTestSuite) TestShadowForecastHoldsNoCapacity() {
+	shadow := s.createRequestParams()
+	shadow.State = params.PrewarmRequestShadow
+	_, _, err := s.store.CreatePrewarmRequest(s.adminCtx, shadow)
+	s.Require().NoError(err)
+
+	remaining, err := s.store.SumRemainingPrewarmForecast(s.adminCtx, s.entity.ID, spotLabelKey)
+	s.Require().NoError(err)
+	s.Require().Zero(remaining, "shadow mode records a forecast without holding capacity")
+}
+
+// The reaper flips expired requests on its own schedule. Until it does, an
+// expired forecast must already have stopped holding capacity open.
+func (s *PrewarmTestSuite) TestExpiredForecastHoldsNoCapacity() {
+	expired := s.createRequestParams()
+	expired.ExpiresAt = time.Now().Add(-time.Minute)
+	_, _, err := s.store.CreatePrewarmRequest(s.adminCtx, expired)
+	s.Require().NoError(err)
+
+	remaining, err := s.store.SumRemainingPrewarmForecast(s.adminCtx, s.entity.ID, spotLabelKey)
+	s.Require().NoError(err)
+	s.Require().Zero(remaining)
+}
+
+func (s *PrewarmTestSuite) TestForecastIsScopedToItsEntity() {
+	_, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
+	s.Require().NoError(err)
+
+	other := uuid.New().String()
+	remaining, err := s.store.SumRemainingPrewarmForecast(s.adminCtx, other, spotLabelKey)
+	s.Require().NoError(err)
+	s.Require().Zero(remaining, "one entity's forecast must not size another's capacity")
+}
+
 func (s *PrewarmTestSuite) TestClaimSpeculativeInstance() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)

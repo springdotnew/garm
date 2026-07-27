@@ -239,9 +239,17 @@ func aggregatePrewarmDemand(requests []params.PrewarmRequest) []params.PrewarmDe
 }
 
 func (r *basePoolManager) reconcilePrewarmTarget(demand params.PrewarmDemand) error {
-	pool, err := r.resolvePrewarmPool(demand)
+	pool, isPoolTarget, err := r.resolvePrewarmPool(demand)
 	if err != nil {
 		return err
+	}
+	if !isPoolTarget {
+		// Nothing here serves this label set. A scale set target looks exactly
+		// like this from the pool manager, and its own worker owns it.
+		slog.DebugContext(
+			r.ctx, "prewarm target does not address a pool of this entity",
+			"label_key", demand.LabelKey)
+		return nil
 	}
 
 	available, err := r.store.CountPoolAvailableCapacity(r.ctx, pool.ID)
@@ -294,14 +302,16 @@ func (r *basePoolManager) reconcilePrewarmTarget(demand params.PrewarmDemand) er
 	return nil
 }
 
-// resolvePrewarmPool finds the single enabled pool a forecast target addresses.
-// A target that resolves to zero or several pools is a profile error: acting on
-// it would put runners somewhere the operator did not intend, so it is refused
-// rather than guessed.
-func (r *basePoolManager) resolvePrewarmPool(demand params.PrewarmDemand) (params.Pool, error) {
+// resolvePrewarmPool finds the enabled pool a forecast target addresses.
+//
+// No pool is not an error: the target may name a scale set, or a pool of a
+// different entity, and either way this pool manager has nothing to do. Several
+// pools is an error, because acting on it would put runners somewhere the
+// operator did not choose, and guessing is worse than refusing.
+func (r *basePoolManager) resolvePrewarmPool(demand params.PrewarmDemand) (params.Pool, bool, error) {
 	pools, err := r.store.FindPoolsMatchingAllTags(r.ctx, r.entity.EntityType, r.entity.ID, demand.Labels)
 	if err != nil {
-		return params.Pool{}, fmt.Errorf("error finding pools for labels: %w", err)
+		return params.Pool{}, false, fmt.Errorf("error finding pools for labels: %w", err)
 	}
 
 	enabled := make([]params.Pool, 0, len(pools))
@@ -311,12 +321,16 @@ func (r *basePoolManager) resolvePrewarmPool(demand params.PrewarmDemand) (param
 		}
 	}
 
-	if len(enabled) != 1 {
-		return params.Pool{}, fmt.Errorf(
+	switch len(enabled) {
+	case 0:
+		return params.Pool{}, false, nil
+	case 1:
+		return enabled[0], true, nil
+	default:
+		return params.Pool{}, false, fmt.Errorf(
 			"prewarm target [%s] resolves to %d enabled pools; it must resolve to exactly one",
 			demand.LabelKey, len(enabled))
 	}
-	return enabled[0], nil
 }
 
 // capSpeculativeDeficit trims a deficit to what the global speculative cap

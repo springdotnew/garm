@@ -16,6 +16,7 @@ package sql
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -159,6 +160,41 @@ func (s *sqlDatabase) ListActivePrewarmRequests(_ context.Context, entityID stri
 		ret = append(ret, converted)
 	}
 	return ret, nil
+}
+
+// SumRemainingPrewarmForecast returns how much of the forecast for a label set
+// is still unmet across an entity's live requests.
+//
+// Shadow requests are excluded — they record what would have happened without
+// creating anything — and so are requests whose window has closed but whose
+// state the reaper has not flipped yet, so a stale forecast can never hold
+// capacity open past its expiry.
+func (s *sqlDatabase) SumRemainingPrewarmForecast(_ context.Context, entityID, labelKey string) (uint, error) {
+	asUUID, err := uuid.Parse(entityID)
+	if err != nil {
+		return 0, fmt.Errorf("error parsing entity id: %w", err)
+	}
+
+	// Rows where demand has caught up with the target are filtered out rather
+	// than clamped, which keeps the sum non-negative without a per-row MAX()
+	// that sqlite and postgres spell differently.
+	var remaining sql.NullInt64
+	q := s.conn.Model(&PrewarmRequestTarget{}).
+		Joins("JOIN prewarm_requests ON prewarm_requests.id = prewarm_request_targets.prewarm_request_id").
+		Where("prewarm_requests.entity_id = ? AND prewarm_requests.state = ? AND prewarm_requests.deleted_at IS NULL",
+			asUUID, string(params.PrewarmRequestActive)).
+		Where("prewarm_requests.expires_at > ?", time.Now()).
+		Where("prewarm_request_targets.label_key = ? AND prewarm_request_targets.observed_demand < prewarm_request_targets.target_count",
+			labelKey).
+		Select("SUM(prewarm_request_targets.target_count - prewarm_request_targets.observed_demand)").
+		Scan(&remaining)
+	if q.Error != nil {
+		return 0, fmt.Errorf("error summing prewarm forecast: %w", q.Error)
+	}
+	if !remaining.Valid || remaining.Int64 <= 0 {
+		return 0, nil
+	}
+	return uint(remaining.Int64), nil
 }
 
 // ConsumePrewarmForecast records that a real job with the given label set has
