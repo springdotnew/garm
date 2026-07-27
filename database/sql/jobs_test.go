@@ -21,6 +21,8 @@ import (
 
 	"github.com/stretchr/testify/suite"
 
+	runnerErrors "github.com/cloudbase/garm-provider-common/errors"
+	commonParams "github.com/cloudbase/garm-provider-common/params"
 	dbCommon "github.com/cloudbase/garm/database/common"
 	"github.com/cloudbase/garm/database/watcher"
 	garmTesting "github.com/cloudbase/garm/internal/testing"
@@ -31,6 +33,7 @@ type JobsTestSuite struct {
 	suite.Suite
 	Store    dbCommon.Store
 	adminCtx context.Context
+	entity   params.ForgeEntity
 }
 
 func (s *JobsTestSuite) SetupTest() {
@@ -43,6 +46,17 @@ func (s *JobsTestSuite) SetupTest() {
 
 	adminCtx := garmTesting.ImpersonateAdminContext(ctx, db, s.T())
 	s.adminCtx = adminCtx
+
+	endpoint := garmTesting.CreateDefaultGithubEndpoint(adminCtx, db, s.T())
+	creds := garmTesting.CreateTestGithubCredentials(adminCtx, "jobs-creds", db, s.T(), endpoint)
+	repo, err := db.CreateRepository(
+		adminCtx, "test-owner", "test-repo", creds,
+		"test-webhook-secret", params.PoolBalancerTypeRoundRobin, false)
+	s.Require().NoError(err)
+
+	entity, err := repo.GetEntity()
+	s.Require().NoError(err)
+	s.entity = entity
 }
 
 func (s *JobsTestSuite) TearDownTest() {
@@ -238,4 +252,104 @@ func (s *JobsTestSuite) TestDeleteInactionableJobs_WithDuration() {
 	err = db.conn.Where("workflow_job_id = ?", 30001).First(&remaining).Error
 	s.Require().NoError(err)
 	s.Require().Equal("recent-completed", remaining.Name)
+}
+
+// createJobRunner registers a runner the way a pool manager would, so a job
+// can be attached to it by name.
+func (s *JobsTestSuite) createJobRunner(name string) params.Instance {
+	pool, err := s.Store.CreateEntityPool(s.adminCtx, s.entity, params.CreatePoolParams{
+		ProviderName:   "test-provider",
+		MaxRunners:     10,
+		MinIdleRunners: 0,
+		Image:          "test-image",
+		Flavor:         "test-flavor",
+		OSType:         "linux",
+		OSArch:         "amd64",
+		Tags:           []string{"self-hosted", name},
+		Enabled:        true,
+	})
+	s.Require().NoError(err)
+
+	instance, err := s.Store.CreateInstance(s.adminCtx, pool.ID, params.CreateInstanceParams{
+		Name:   name,
+		OSType: "linux",
+		OSArch: "amd64",
+		Status: commonParams.InstanceRunning,
+	})
+	s.Require().NoError(err)
+	return instance
+}
+
+// TestGetJobByInstanceID verifies the lookup a preemption notice depends on:
+// the runner reports itself, and GARM has to find the job it is running to
+// know which retry to pre-acquire for.
+func (s *JobsTestSuite) TestGetJobByInstanceID() {
+	instance := s.createJobRunner("garm-abc123")
+
+	_, err := s.Store.CreateOrUpdateJob(s.adminCtx, params.Job{
+		WorkflowJobID:   40001,
+		RunID:           67890,
+		RunAttempt:      1,
+		Status:          string(params.JobStatusInProgress),
+		Name:            "typecheck",
+		WorkflowName:    "PR Tests",
+		RunnerName:      instance.Name,
+		RepositoryName:  "spring",
+		RepositoryOwner: "springdotnew",
+	})
+	s.Require().NoError(err)
+
+	fetched, err := s.Store.GetJobByInstanceID(s.adminCtx, instance.ID)
+	s.Require().NoError(err)
+	s.Require().Equal(int64(40001), fetched.WorkflowJobID)
+	s.Require().Equal(int64(67890), fetched.RunID)
+	s.Require().Equal(int64(1), fetched.RunAttempt)
+	s.Require().Equal("PR Tests", fetched.WorkflowName)
+	s.Require().Equal("springdotnew", fetched.RepositoryOwner)
+	s.Require().Equal("spring", fetched.RepositoryName)
+	s.Require().Equal("garm-abc123", fetched.RunnerName)
+}
+
+// A runner preempted before it picked anything up has no job, and the caller
+// needs to be able to tell that apart from a failure.
+func (s *JobsTestSuite) TestGetJobByInstanceIDNotFound() {
+	instance := s.createJobRunner("garm-never-claimed")
+
+	_, err := s.Store.GetJobByInstanceID(s.adminCtx, instance.ID)
+	s.Require().ErrorIs(err, runnerErrors.ErrNotFound)
+}
+
+func (s *JobsTestSuite) TestGetJobByInstanceIDRejectsAMalformedID() {
+	_, err := s.Store.GetJobByInstanceID(s.adminCtx, "not-a-uuid")
+	s.Require().ErrorIs(err, runnerErrors.ErrBadRequest)
+}
+
+// A runner can be recorded against more than one job row over its life; the
+// newest is the one it is on now.
+func (s *JobsTestSuite) TestGetJobByInstanceIDReturnsMostRecent() {
+	db := s.Store.(*sqlDatabase)
+	instance := s.createJobRunner("garm-recycled")
+
+	for _, id := range []int64{40002, 40003} {
+		_, err := s.Store.CreateOrUpdateJob(s.adminCtx, params.Job{
+			WorkflowJobID:   id,
+			RunID:           67891,
+			Status:          string(params.JobStatusInProgress),
+			Name:            "shard",
+			RunnerName:      instance.Name,
+			RepositoryName:  "spring",
+			RepositoryOwner: "springdotnew",
+		})
+		s.Require().NoError(err)
+	}
+
+	// Backdate the first row so the ordering is unambiguous.
+	err := db.conn.Model(&WorkflowJob{}).
+		Where("workflow_job_id = ?", 40002).
+		Update("updated_at", time.Now().Add(-1*time.Hour)).Error
+	s.Require().NoError(err)
+
+	fetched, err := s.Store.GetJobByInstanceID(s.adminCtx, instance.ID)
+	s.Require().NoError(err)
+	s.Require().Equal(int64(40003), fetched.WorkflowJobID)
 }

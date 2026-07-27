@@ -130,6 +130,65 @@ labels = ["my-scale-set"]
 count = 20
 ```
 
+## Preemption replacement
+
+Spot capacity is reclaimed with a short notice, and the job on it dies part-way
+through. Its retry then starts from zero on a cold runner — the most expensive
+thing that can happen to a run, because it lands on the longest path and the
+clock has already been running.
+
+A rule cannot help here: there is no gate job ahead of a preemption to forecast
+from, and by the time GitHub queues the retry the boot has to happen. The only
+warning anyone gets goes to the machine that is about to disappear, so that is
+what reports it:
+
+```toml
+[prewarm.preemption]
+enable = true
+ttl = "30m"     # long enough to cover the rest of a run
+
+[[prewarm.preemption.replacement]]
+from = ["gcp-4vcpu-spot"]
+to   = ["gcp-4vcpu"]
+
+[[prewarm.preemption.replacement]]
+from = ["gcp-2vcpu-arm-spot"]
+to   = ["gcp-2vcpu-arm"]
+```
+
+A runner that receives a preemption notice from its cloud POSTs to
+`/api/v1/callbacks/preempted` using the token it already has. GARM looks up the
+job it was running and records a one-runner forecast for the *next* attempt of
+that run, on the labels the retry will ask for. Everything after that is
+ordinary prewarming: the reconciler creates it, the claim path hands it to the
+retry when GitHub queues it, and the reaper removes it if the retry never comes.
+
+The `from` set is the preempted runner's labels — a pool's tags, or a scale
+set's name. `to` is what the retry will request. A fleet that reruns onto
+standard twins maps each spot label to its twin; a fleet without twins maps a
+label to itself. A label set with no mapping is left alone: pre-acquiring the
+wrong labels buys nothing and costs a machine.
+
+Reporting is idempotent per job, so a watchdog that fires twice — or a retried
+POST — pre-acquires one runner. A runner reclaimed before it picked up a job
+has no retry coming and is a no-op. `shadow` mode records the replacement
+without creating it, the same as any other forecast.
+
+Two counters cover it:
+
+| Metric | Meaning |
+| --- | --- |
+| `garm_prewarm_preemptions_reported_total` | Notices received, whatever the configuration does with them |
+| `garm_prewarm_preemption_replacements_total{target}` | Replacements actually pre-acquired |
+
+The first is incremented even while preemption replacement is disabled, so you
+can size the problem before deciding to act on it.
+
+> [!NOTE]
+> Delivering the notice is the image's job, not GARM's. On GCE the runner polls
+> `metadata.google.internal` for `preempted`; on EC2 it polls the instance
+> metadata for a spot interruption notice. GARM only receives the report.
+
 ## Turning it off in a hurry
 
 ```bash

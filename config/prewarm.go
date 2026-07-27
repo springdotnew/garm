@@ -36,6 +36,13 @@ const (
 	// minute.
 	DefaultPrewarmTTL = 8 * time.Minute
 
+	// DefaultPrewarmPreemptionTTL is how long a replacement forecast is kept
+	// when the preemption section leaves it unset. It is much longer than
+	// DefaultPrewarmTTL because what separates a preemption from the retry it
+	// causes is the rest of the workflow run, not a gate job that resolves in
+	// about a minute.
+	DefaultPrewarmPreemptionTTL = 30 * time.Minute
+
 	// prewarmTriggerActionQueued is the only webhook action a rule may trigger
 	// on. A forecast is only useful while the fanout has not been queued yet.
 	prewarmTriggerActionQueued = "queued"
@@ -66,6 +73,9 @@ type Prewarm struct {
 	DefaultTTL PrewarmTTL `toml:"default_ttl" json:"default-ttl"`
 	// Rules are the trigger definitions. Rule IDs must be unique.
 	Rules []PrewarmRule `toml:"rule,omitempty" json:"rule,omitempty"`
+	// Preemption pre-acquires replacement capacity when a spot runner is about
+	// to be reclaimed.
+	Preemption PrewarmPreemption `toml:"preemption,omitempty" json:"preemption,omitempty"`
 }
 
 // IsActive reports whether matched rules should create real instances.
@@ -92,6 +102,10 @@ func (p *Prewarm) Validate() error {
 
 	if err := p.validateRules(); err != nil {
 		return err
+	}
+
+	if err := p.Preemption.Validate(); err != nil {
+		return fmt.Errorf("error validating prewarm preemption: %w", err)
 	}
 
 	if !p.Enable {
@@ -242,6 +256,113 @@ func (p *PrewarmRule) Matches(repository, workflow, jobName, action string, runA
 	return p.RunAttempt == 0 || p.RunAttempt == runAttempt
 }
 
+// PrewarmPreemption pre-acquires replacement capacity when a spot runner is
+// about to be reclaimed.
+//
+// A preemption is the most expensive thing that can happen to a pull request:
+// the job dies part-way through, and its retry starts from zero on a cold
+// runner. On the longest path that lands directly on the wall-clock time to a
+// green build, and unlike an ordinary fanout there is no gate job ahead of it
+// to prewarm from — by the time GitHub queues the retry, the boot has to
+// happen.
+//
+// But the runner knows first. The cloud gives it a preemption notice before the
+// machine goes away, and the runner reports that notice to GARM, which starts
+// the replacement immediately. By the time the retry is queued the runner is
+// warm, and the claim path hands it over exactly as it would a forecast runner.
+//
+// The zero value is disabled and a no-op on every code path.
+type PrewarmPreemption struct {
+	// Enable turns preemption replacement on.
+	Enable bool `toml:"enable" json:"enable"`
+	// TTL is how long an unclaimed replacement is kept. It defaults to
+	// DefaultPrewarmPreemptionTTL, which is long enough to cover the rest of a
+	// workflow run, because that is what stands between a preemption and the
+	// retry it causes.
+	TTL PrewarmTTL `toml:"ttl,omitempty" json:"ttl,omitempty"`
+	// Replacements maps the label set of a preempted runner to the label set
+	// its retry will ask for. A fleet that reruns onto standard twins maps
+	// each spot label to its twin; a fleet without twins maps a label to
+	// itself.
+	Replacements []PrewarmReplacement `toml:"replacement,omitempty" json:"replacement,omitempty"`
+}
+
+// Duration returns the configured replacement TTL, or the default if unset.
+func (p *PrewarmPreemption) Duration() time.Duration {
+	return p.TTL.DurationOr(DefaultPrewarmPreemptionTTL)
+}
+
+// Validate validates the preemption configuration. Like the rules, it is
+// validated even while disabled so a typo surfaces when it is written.
+func (p *PrewarmPreemption) Validate() error {
+	if _, err := p.TTL.ParseDuration(); err != nil {
+		return fmt.Errorf("invalid ttl: %w", err)
+	}
+
+	seenFrom := map[string]struct{}{}
+	for idx := range p.Replacements {
+		replacement := &p.Replacements[idx]
+		if err := replacement.Validate(); err != nil {
+			return fmt.Errorf("error validating replacement %d: %w", idx, err)
+		}
+		key := replacement.FromKey()
+		if _, ok := seenFrom[key]; ok {
+			return fmt.Errorf("duplicate replacement for label set [%s]", key)
+		}
+		seenFrom[key] = struct{}{}
+	}
+
+	if p.Enable && len(p.Replacements) == 0 {
+		return fmt.Errorf("preemption is enabled but no replacement is defined")
+	}
+	return nil
+}
+
+// ReplacementFor returns the label set to pre-acquire for a preempted runner
+// that carried the given labels. Labels are compared order- and
+// case-insensitively, the same way a target's label set is.
+func (p *PrewarmPreemption) ReplacementFor(labels []string) ([]string, bool) {
+	if !p.Enable {
+		return nil, false
+	}
+	key := NormalizeLabelKey(labels)
+	if key == "" {
+		return nil, false
+	}
+	for idx := range p.Replacements {
+		if p.Replacements[idx].FromKey() == key {
+			return p.Replacements[idx].To, true
+		}
+	}
+	return nil, false
+}
+
+// PrewarmReplacement maps a preempted runner's label set to the one its retry
+// will request.
+type PrewarmReplacement struct {
+	// From is the label set of the runner that was preempted.
+	From []string `toml:"from" json:"from"`
+	// To is the label set the retry will request. Often the standard twin of
+	// From, because a rerun is routed away from spot.
+	To []string `toml:"to" json:"to"`
+}
+
+// Validate validates a single replacement mapping.
+func (p *PrewarmReplacement) Validate() error {
+	if err := validateLabelSet(p.From); err != nil {
+		return fmt.Errorf("invalid from: %w", err)
+	}
+	if err := validateLabelSet(p.To); err != nil {
+		return fmt.Errorf("invalid to: %w", err)
+	}
+	return nil
+}
+
+// FromKey is the canonical identity of the preempted label set.
+func (p *PrewarmReplacement) FromKey() string {
+	return NormalizeLabelKey(p.From)
+}
+
 // PrewarmTarget is one pool's worth of forecast demand, addressed by the label
 // set the downstream jobs will request.
 type PrewarmTarget struct {
@@ -255,16 +376,23 @@ type PrewarmTarget struct {
 
 // Validate validates a single target.
 func (p *PrewarmTarget) Validate() error {
-	if len(p.Labels) == 0 {
-		return fmt.Errorf("at least one label is mandatory")
-	}
-	for _, label := range p.Labels {
-		if strings.TrimSpace(label) == "" {
-			return fmt.Errorf("labels must not be empty")
-		}
+	if err := validateLabelSet(p.Labels); err != nil {
+		return err
 	}
 	if p.Count == 0 {
 		return fmt.Errorf("count must be greater than 0")
+	}
+	return nil
+}
+
+func validateLabelSet(labels []string) error {
+	if len(labels) == 0 {
+		return fmt.Errorf("at least one label is mandatory")
+	}
+	for _, label := range labels {
+		if strings.TrimSpace(label) == "" {
+			return fmt.Errorf("labels must not be empty")
+		}
 	}
 	return nil
 }

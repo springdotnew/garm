@@ -132,6 +132,9 @@ type JobsStore interface {
 	ListAllJobs(ctx context.Context) ([]params.Job, error)
 
 	GetJobByID(ctx context.Context, jobID int64) (params.Job, error)
+	// GetJobByInstanceID returns the job a runner is executing. Runners are
+	// ephemeral and run exactly one job.
+	GetJobByInstanceID(ctx context.Context, instanceID string) (params.Job, error)
 	DeleteJob(ctx context.Context, jobID int64) error
 	UnlockJob(ctx context.Context, jobID int64, entityID string) error
 	LockJob(ctx context.Context, jobID int64, entityID string) error

@@ -316,3 +316,175 @@ default_ttl = "eight minutes"
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "invalid duration")
 }
+
+func validPrewarmPreemption() PrewarmPreemption {
+	return PrewarmPreemption{
+		Enable: true,
+		Replacements: []PrewarmReplacement{
+			{From: []string{"gcp-4vcpu-spot"}, To: []string{"gcp-4vcpu"}},
+			{From: []string{"gcp-8vcpu-spot"}, To: []string{"gcp-8vcpu"}},
+		},
+	}
+}
+
+func TestPrewarmPreemptionZeroValueIsDisabledAndValid(t *testing.T) {
+	var preemption PrewarmPreemption
+	require.NoError(t, preemption.Validate())
+	require.Equal(t, DefaultPrewarmPreemptionTTL, preemption.Duration())
+
+	_, ok := preemption.ReplacementFor([]string{"gcp-4vcpu-spot"})
+	require.False(t, ok, "a disabled preemption must never resolve a replacement")
+}
+
+func TestPrewarmPreemptionValidate(t *testing.T) {
+	tests := []struct {
+		name      string
+		mutate    func(*PrewarmPreemption)
+		errString string
+	}{
+		{
+			name:      "invalid ttl",
+			mutate:    func(p *PrewarmPreemption) { p.TTL = "half an hour" },
+			errString: "invalid ttl",
+		},
+		{
+			name:      "negative ttl",
+			mutate:    func(p *PrewarmPreemption) { p.TTL = "-30m" },
+			errString: "invalid ttl",
+		},
+		{
+			name:      "enabled with no replacement",
+			mutate:    func(p *PrewarmPreemption) { p.Replacements = nil },
+			errString: "no replacement is defined",
+		},
+		{
+			name: "empty from",
+			mutate: func(p *PrewarmPreemption) {
+				p.Replacements = []PrewarmReplacement{{From: nil, To: []string{"gcp-4vcpu"}}}
+			},
+			errString: "invalid from: at least one label is mandatory",
+		},
+		{
+			name: "blank to",
+			mutate: func(p *PrewarmPreemption) {
+				p.Replacements = []PrewarmReplacement{{From: []string{"gcp-4vcpu-spot"}, To: []string{"  "}}}
+			},
+			errString: "invalid to: labels must not be empty",
+		},
+		{
+			name: "duplicate from differing only by order and case",
+			mutate: func(p *PrewarmPreemption) {
+				p.Replacements = []PrewarmReplacement{
+					{From: []string{"gcp-4vcpu", "spot"}, To: []string{"gcp-4vcpu"}},
+					{From: []string{"SPOT", "gcp-4vcpu"}, To: []string{"gcp-8vcpu"}},
+				}
+			},
+			errString: "duplicate replacement for label set",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			preemption := validPrewarmPreemption()
+			tc.mutate(&preemption)
+			err := preemption.Validate()
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.errString)
+		})
+	}
+}
+
+// A malformed replacement must be rejected even while prewarming as a whole is
+// off, for the same reason a malformed rule is.
+func TestPrewarmPreemptionValidatedWhileDisabled(t *testing.T) {
+	cfg := validPrewarmConfig()
+	cfg.Enable = false
+	cfg.Preemption = PrewarmPreemption{
+		Replacements: []PrewarmReplacement{{From: []string{"gcp-4vcpu-spot"}, To: nil}},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid to: at least one label is mandatory")
+}
+
+func TestPrewarmPreemptionReplacementFor(t *testing.T) {
+	preemption := validPrewarmPreemption()
+
+	replacement, ok := preemption.ReplacementFor([]string{"gcp-4vcpu-spot"})
+	require.True(t, ok)
+	require.Equal(t, []string{"gcp-4vcpu"}, replacement)
+
+	// A runner's labels arrive from its pool tags or scale set name, in whatever
+	// order and case the forge recorded them.
+	replacement, ok = preemption.ReplacementFor([]string{"GCP-8VCPU-SPOT"})
+	require.True(t, ok)
+	require.Equal(t, []string{"gcp-8vcpu"}, replacement)
+
+	_, ok = preemption.ReplacementFor([]string{"gcp-2vcpu-spot"})
+	require.False(t, ok, "an unmapped label set must not be replaced")
+
+	_, ok = preemption.ReplacementFor(nil)
+	require.False(t, ok)
+}
+
+// A fleet with no standard twins still wants the replacement, it just wants it
+// on the same labels.
+func TestPrewarmPreemptionReplacementCanBeIdentity(t *testing.T) {
+	preemption := PrewarmPreemption{
+		Enable:       true,
+		Replacements: []PrewarmReplacement{{From: []string{"gcp-4vcpu-spot"}, To: []string{"gcp-4vcpu-spot"}}},
+	}
+	require.NoError(t, preemption.Validate())
+
+	replacement, ok := preemption.ReplacementFor([]string{"gcp-4vcpu-spot"})
+	require.True(t, ok)
+	require.Equal(t, []string{"gcp-4vcpu-spot"}, replacement)
+}
+
+func TestPrewarmPreemptionDecodesFromTOML(t *testing.T) {
+	const document = `
+[prewarm]
+enable = true
+mode = "active"
+max_speculative_runners = 120
+default_ttl = "8m"
+
+[[prewarm.rule]]
+id = "spring-pr-tests-attempt-1"
+repository = "springdotnew/spring"
+workflow = "PR Tests"
+trigger_job = "changes"
+
+[[prewarm.rule.target]]
+labels = ["gcp-4vcpu-spot"]
+count = 79
+
+[prewarm.preemption]
+enable = true
+ttl = "30m"
+
+[[prewarm.preemption.replacement]]
+from = ["gcp-4vcpu-spot"]
+to = ["gcp-4vcpu"]
+
+[[prewarm.preemption.replacement]]
+from = ["gcp-2vcpu-arm-spot"]
+to = ["gcp-2vcpu-arm"]
+`
+
+	var cfg struct {
+		Prewarm Prewarm `toml:"prewarm"`
+	}
+	_, err := toml.Decode(document, &cfg)
+	require.NoError(t, err)
+	require.NoError(t, cfg.Prewarm.Validate())
+
+	require.True(t, cfg.Prewarm.Preemption.Enable)
+	require.Equal(t, 30*time.Minute, cfg.Prewarm.Preemption.Duration())
+	require.Len(t, cfg.Prewarm.Preemption.Replacements, 2)
+
+	replacement, ok := cfg.Prewarm.Preemption.ReplacementFor([]string{"gcp-2vcpu-arm-spot"})
+	require.True(t, ok)
+	require.Equal(t, []string{"gcp-2vcpu-arm"}, replacement)
+}

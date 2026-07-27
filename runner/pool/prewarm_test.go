@@ -43,6 +43,7 @@ const (
 	prewarmTestGateJob   = "changes"
 	prewarmTestRuleID    = "spring-pr-tests"
 	prewarmTestCohortLen = 4
+	prewarmTestQueued    = "queued"
 )
 
 // prewarmTestLabels is both the pool's tag set and the forecast target, which
@@ -167,13 +168,13 @@ func (s *PrewarmPoolTestSuite) gateJob(jobID, runID int64) params.WorkflowJob {
 }
 
 func (s *PrewarmPoolTestSuite) workflowJob(jobID, runID int64, name, workflow string) params.WorkflowJob {
-	wj := params.WorkflowJob{Action: "queued"}
+	wj := params.WorkflowJob{Action: prewarmTestQueued}
 	wj.WorkflowJob.ID = jobID
 	wj.WorkflowJob.RunID = runID
 	wj.WorkflowJob.RunAttempt = 1
 	wj.WorkflowJob.Name = name
 	wj.WorkflowJob.WorkflowName = workflow
-	wj.WorkflowJob.Status = "queued"
+	wj.WorkflowJob.Status = prewarmTestQueued
 	wj.WorkflowJob.Labels = prewarmTestLabels
 	wj.Repository.Name = "test-repo"
 	wj.Repository.Owner.Login = "test-owner"

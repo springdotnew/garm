@@ -92,6 +92,8 @@ func RegisterMetrics() error {
 		PrewarmInstancesClaimed,
 		PrewarmInstancesReaped,
 		PrewarmIdleSeconds,
+		PrewarmPreemptionsReported,
+		PrewarmPreemptionReplacements,
 		PrewarmReconcileDuration,
 	)
 

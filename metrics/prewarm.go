@@ -61,6 +61,20 @@ var (
 		Help:      "Seconds that reaped speculative runners were alive without ever serving a job. This is the cost of a forecast that did not pay off; runners that were claimed are not counted here, because their lifetime was work.",
 	}, []string{"target", "pool"})
 
+	PrewarmPreemptionsReported = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsPrewarmSubsystem,
+		Name:      "preemptions_reported_total",
+		Help:      "Number of preemption notices reported by runners. Counted whether or not preemption replacement is enabled, so the rate is visible before it is acted on.",
+	})
+
+	PrewarmPreemptionReplacements = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsPrewarmSubsystem,
+		Name:      "preemption_replacements_total",
+		Help:      "Number of replacement runners forecast for a preempted runner's retry, by the label set the retry will request",
+	}, []string{"target"})
+
 	PrewarmReconcileDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: metricsNamespace,
 		Subsystem: metricsPrewarmSubsystem,

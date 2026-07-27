@@ -499,6 +499,31 @@ func (s *sqlDatabase) GetJobByID(_ context.Context, jobID int64) (params.Job, er
 	return sqlWorkflowJobToParamsJob(job)
 }
 
+// GetJobByInstanceID returns the job a runner is executing. A runner is
+// ephemeral and runs exactly one job, so the most recently updated row that
+// points at that instance is the one it is on.
+func (s *sqlDatabase) GetJobByInstanceID(_ context.Context, instanceID string) (params.Job, error) {
+	asUUID, err := uuid.Parse(instanceID)
+	if err != nil {
+		return params.Job{}, fmt.Errorf("error parsing id: %w", runnerErrors.ErrBadRequest)
+	}
+
+	var job WorkflowJob
+	query := s.conn.Model(&WorkflowJob{}).
+		Preload("Instance").
+		Where("instance_id = ?", asUUID).
+		Order("updated_at DESC")
+
+	if err := query.First(&job); err.Error != nil {
+		if errors.Is(err.Error, gorm.ErrRecordNotFound) {
+			return params.Job{}, runnerErrors.ErrNotFound
+		}
+		return params.Job{}, err.Error
+	}
+
+	return sqlWorkflowJobToParamsJob(job)
+}
+
 // DeleteInactionableJobs will delete jobs that are not in queued state and have no
 // runner associated with them. This can happen if we have a pool that matches labels
 // defined on a job, but the job itself was picked up by a runner we don't manage.

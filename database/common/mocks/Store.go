@@ -3504,6 +3504,63 @@ func (_c *Store_GetJobByID_Call) RunAndReturn(run func(context.Context, int64) (
 	return _c
 }
 
+// GetJobByInstanceID provides a mock function with given fields: ctx, instanceID
+func (_m *Store) GetJobByInstanceID(ctx context.Context, instanceID string) (params.Job, error) {
+	ret := _m.Called(ctx, instanceID)
+
+	if len(ret) == 0 {
+		panic("no return value specified for GetJobByInstanceID")
+	}
+
+	var r0 params.Job
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, string) (params.Job, error)); ok {
+		return rf(ctx, instanceID)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, string) params.Job); ok {
+		r0 = rf(ctx, instanceID)
+	} else {
+		r0 = ret.Get(0).(params.Job)
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, string) error); ok {
+		r1 = rf(ctx, instanceID)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// Store_GetJobByInstanceID_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'GetJobByInstanceID'
+type Store_GetJobByInstanceID_Call struct {
+	*mock.Call
+}
+
+// GetJobByInstanceID is a helper method to define mock.On call
+//   - ctx context.Context
+//   - instanceID string
+func (_e *Store_Expecter) GetJobByInstanceID(ctx interface{}, instanceID interface{}) *Store_GetJobByInstanceID_Call {
+	return &Store_GetJobByInstanceID_Call{Call: _e.mock.On("GetJobByInstanceID", ctx, instanceID)}
+}
+
+func (_c *Store_GetJobByInstanceID_Call) Run(run func(ctx context.Context, instanceID string)) *Store_GetJobByInstanceID_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(string))
+	})
+	return _c
+}
+
+func (_c *Store_GetJobByInstanceID_Call) Return(_a0 params.Job, _a1 error) *Store_GetJobByInstanceID_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *Store_GetJobByInstanceID_Call) RunAndReturn(run func(context.Context, string) (params.Job, error)) *Store_GetJobByInstanceID_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // GetOrganization provides a mock function with given fields: ctx, name, endpointName
 func (_m *Store) GetOrganization(ctx context.Context, name string, endpointName string) (params.Organization, error) {
 	ret := _m.Called(ctx, name, endpointName)
