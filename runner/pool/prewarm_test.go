@@ -494,6 +494,49 @@ func (s *PrewarmPoolTestSuite) TestGlobalCapBoundsTheCohort() {
 	s.Len(s.speculativeInstances(), 2)
 }
 
+// Cohorts are created concurrently, one goroutine per target, so the global cap
+// is the one thing that has to be settled before any of them starts. Two targets
+// sizing themselves against the same in-flight count would each take the whole
+// headroom, and the cap would bind neither.
+func (s *PrewarmPoolTestSuite) TestGlobalCapBindsAcrossConcurrentTargets() {
+	secondLabels := []string{"self-hosted", "linux", "arm64"}
+	second, err := s.store.CreateEntityPool(s.adminCtx, s.entity, params.CreatePoolParams{
+		ProviderName:   "test-provider",
+		MaxRunners:     50,
+		MinIdleRunners: 0,
+		Image:          "test-image",
+		Flavor:         "test-flavor",
+		OSType:         "linux",
+		OSArch:         "arm64",
+		Tags:           secondLabels,
+		Enabled:        true,
+	})
+	s.Require().NoError(err)
+	cache.SetEntityPool(s.entity.ID, second)
+
+	cfg := s.prewarmConfig(config.PrewarmModeActive)
+	cfg.MaxSpeculativeRunners = 5
+	cfg.Rules[0].Targets = []config.PrewarmTarget{
+		{Labels: prewarmTestLabels, Count: prewarmTestCohortLen},
+		{Labels: secondLabels, Count: prewarmTestCohortLen},
+	}
+	s.mgr.prewarmCfg = cfg
+
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+
+	total, err := s.store.CountSpeculativeInstances(s.adminCtx)
+	s.Require().NoError(err)
+	s.EqualValues(5, total, "two targets asking for %d each must still stop at the cap", prewarmTestCohortLen)
+
+	// And the cap keeps binding once it is reached, rather than being a
+	// first-pass-only budget.
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+	total, err = s.store.CountSpeculativeInstances(s.adminCtx)
+	s.Require().NoError(err)
+	s.EqualValues(5, total)
+}
+
 func (s *PrewarmPoolTestSuite) TestOverlappingRunsShareCapacity() {
 	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
 	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(2, 200)))
