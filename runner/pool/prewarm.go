@@ -479,18 +479,52 @@ const speculativeDrainHorizon = 100 * 365 * 24 * time.Hour
 // Turning prewarming off still has to give back what it was holding: no job can
 // claim a speculative runner once the feature is disabled, and one nobody
 // reclaims bills by the second until someone notices. So the disabled path
-// sweeps once, at startup, and does not wait out TTLs that no longer mean
-// anything. Pausing is not the same thing — the kill switch leaves the config
-// enabled precisely so the loop stays up and drains normally.
+// drains instead — immediately, without waiting out TTLs that no longer mean
+// anything — and keeps trying only until a sweep finds nothing left, so the
+// steady state on a controller that never prewarms really is silence. Pausing is
+// not the same thing: the kill switch leaves the config enabled precisely so the
+// loop stays up and drains on its normal schedule.
 func (r *basePoolManager) startSpeculativeReaper() {
 	if r.prewarmCfg.Enable {
 		r.startLoopForFunction(
 			r.reapSpeculativeSurplus, common.PoolReapTimeoutInterval, "prewarm_reaper", false, nil)
 		return
 	}
-	if err := r.drainSpeculativeSurplus(); err != nil {
-		slog.With(slog.Any("error", err)).ErrorContext(
-			r.ctx, "failed to drain the speculative runners a previous configuration left behind")
+	r.drainSpeculativeSurplusUntilEmpty()
+}
+
+// drainSpeculativeSurplusUntilEmpty sweeps until a sweep leaves nothing behind.
+//
+// One sweep is almost always enough. It is not guaranteed to be: a runner can
+// only be removed once the pool manager is running, and at startup that depends
+// on a tools update that may not have succeeded yet. Retrying on the reap
+// interval costs nothing in the normal case, where the first sweep finds zero
+// runners and returns before the first tick.
+func (r *basePoolManager) drainSpeculativeSurplusUntilEmpty() {
+	ticker := time.NewTicker(common.PoolReapTimeoutInterval)
+	defer ticker.Stop()
+
+	for {
+		stranded, err := r.drainSpeculativeSurplus()
+		switch {
+		case err != nil:
+			slog.With(slog.Any("error", err)).ErrorContext(
+				r.ctx, "failed to drain the speculative runners a previous configuration left behind")
+		case stranded == 0:
+			return
+		default:
+			slog.WarnContext(
+				r.ctx, "speculative runners survived a drain sweep and are still billing",
+				"stranded", stranded)
+		}
+
+		select {
+		case <-ticker.C:
+		case <-r.ctx.Done():
+			return
+		case <-r.quit:
+			return
+		}
 	}
 }
 
@@ -506,27 +540,32 @@ func (r *basePoolManager) startSpeculativeReaper() {
 // switch must drain the runners already in flight, not strand them.
 func (r *basePoolManager) reapSpeculativeSurplus() error {
 	now := time.Now()
-	return r.reapSpeculativeSurplusExpiringBefore(now, now)
+	_, err := r.reapSpeculativeSurplusExpiringBefore(now, now)
+	return err
 }
 
 // drainSpeculativeSurplus reclaims every unclaimed speculative runner whatever
-// is left of its TTL. It is the shutdown path for the feature rather than its
-// housekeeping.
-func (r *basePoolManager) drainSpeculativeSurplus() error {
+// is left of its TTL, and reports how many of this entity's it could not
+// reclaim. It is the shutdown path for the feature rather than its housekeeping.
+func (r *basePoolManager) drainSpeculativeSurplus() (int, error) {
 	now := time.Now()
 	return r.reapSpeculativeSurplusExpiringBefore(now, now.Add(speculativeDrainHorizon))
 }
 
-func (r *basePoolManager) reapSpeculativeSurplusExpiringBefore(now, expiringBefore time.Time) error {
+// reapSpeculativeSurplusExpiringBefore returns the number of this entity's
+// runners it listed and failed to remove — zero when there was nothing to do,
+// which is what makes it safe to stop calling.
+func (r *basePoolManager) reapSpeculativeSurplusExpiringBefore(now, expiringBefore time.Time) (int, error) {
 	if _, err := r.store.ExpirePrewarmRequests(r.ctx, now); err != nil {
-		return fmt.Errorf("error expiring prewarm requests: %w", err)
+		return 0, fmt.Errorf("error expiring prewarm requests: %w", err)
 	}
 
 	reapable, err := r.store.ListReapableSpeculativeInstances(r.ctx, expiringBefore)
 	if err != nil {
-		return fmt.Errorf("error listing reapable speculative instances: %w", err)
+		return 0, fmt.Errorf("error listing reapable speculative instances: %w", err)
 	}
 
+	stranded := 0
 	for _, instance := range reapable {
 		pool, ok := r.entityPoolForInstance(instance)
 		if !ok {
@@ -556,6 +595,7 @@ func (r *basePoolManager) reapSpeculativeSurplusExpiringBefore(now, expiringBefo
 			slog.With(slog.Any("error", err)).ErrorContext(
 				r.ctx, "failed to reap speculative runner",
 				"runner_name", instance.Name)
+			stranded++
 			continue
 		}
 
@@ -571,7 +611,7 @@ func (r *basePoolManager) reapSpeculativeSurplusExpiringBefore(now, expiringBefo
 		metrics.PrewarmIdleSeconds.WithLabelValues(labelKey, instance.PoolID).Add(idleSeconds)
 	}
 
-	return nil
+	return stranded, nil
 }
 
 // isLiveSpeculativeRunner reports whether an instance is speculative capacity
