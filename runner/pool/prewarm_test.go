@@ -385,6 +385,48 @@ func (s *PrewarmPoolTestSuite) TestDisabledPrewarmIsANoOp() {
 	s.Empty(s.allInstances())
 }
 
+// Every controller in the fleet runs this code with the feature switched off.
+// The reap loop's first act is a write, so leaving it up on a controller that
+// never turns prewarming on would be a periodic database write forever on
+// behalf of runners that cannot exist.
+func (s *PrewarmPoolTestSuite) TestDisabledPrewarmStartsNoReapLoop() {
+	s.mgr.prewarmCfg = config.Prewarm{}
+
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		s.mgr.startSpeculativeReaper()
+	}()
+
+	select {
+	case <-returned:
+	case <-time.After(10 * time.Second):
+		s.Fail("startSpeculativeReaper did not return with prewarming disabled; it started a loop")
+	}
+}
+
+// The other half of that trade: a controller whose configuration turned
+// prewarming off has to hand back what the old configuration was holding. These
+// runners are nowhere near their expiry and no job will ever claim them again,
+// so waiting the TTL out is time nobody uses and money nobody gets back.
+func (s *PrewarmPoolTestSuite) TestDisablingPrewarmDrainsTheRunnersItLeftBehind() {
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+	for _, instance := range s.speculativeInstances() {
+		s.Require().NotNil(instance.SpeculativeExpiresAt)
+		s.Require().True(instance.SpeculativeExpiresAt.After(time.Now()), "the TTL must still be running")
+	}
+
+	s.mgr.prewarmCfg = config.Prewarm{}
+	s.mgr.startSpeculativeReaper()
+
+	speculative := s.speculativeInstances()
+	s.Require().Len(speculative, prewarmTestCohortLen)
+	for _, instance := range speculative {
+		s.Equal(commonParams.InstancePendingDelete, instance.Status)
+	}
+}
+
 func (s *PrewarmPoolTestSuite) TestKillSwitchStopsCreationWithoutAConfigChange() {
 	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
 

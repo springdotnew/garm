@@ -25,6 +25,7 @@ import (
 	"github.com/cloudbase/garm/config"
 	"github.com/cloudbase/garm/metrics"
 	"github.com/cloudbase/garm/params"
+	"github.com/cloudbase/garm/runner/common"
 )
 
 // prewarmEnabled reports whether this pool manager may act on prewarm rules.
@@ -461,6 +462,38 @@ func (r *basePoolManager) claimSpeculativeRunnerForJob(job params.Job, candidate
 	return true
 }
 
+// speculativeDrainHorizon makes every unclaimed speculative runner look expired
+// to the reap query. A TTL buys a forecast the time it needs to pay off; once
+// prewarming is disabled it cannot pay off, so waiting the TTL out only bills
+// for the wait.
+const speculativeDrainHorizon = 100 * 365 * 24 * time.Hour
+
+// startSpeculativeReaper runs the reaper, or drains once in place of it.
+//
+// Prewarming is off by default and most controllers will never turn it on. The
+// reconciler costs nothing to leave looping because it returns before its first
+// query, but the reaper's first act is a write, so an unconditional loop would
+// put a periodic UPDATE on every controller in the fleet forever, on behalf of
+// runners that cannot exist.
+//
+// Turning prewarming off still has to give back what it was holding: no job can
+// claim a speculative runner once the feature is disabled, and one nobody
+// reclaims bills by the second until someone notices. So the disabled path
+// sweeps once, at startup, and does not wait out TTLs that no longer mean
+// anything. Pausing is not the same thing — the kill switch leaves the config
+// enabled precisely so the loop stays up and drains normally.
+func (r *basePoolManager) startSpeculativeReaper() {
+	if r.prewarmCfg.Enable {
+		r.startLoopForFunction(
+			r.reapSpeculativeSurplus, common.PoolReapTimeoutInterval, "prewarm_reaper", false, nil)
+		return
+	}
+	if err := r.drainSpeculativeSurplus(); err != nil {
+		slog.With(slog.Any("error", err)).ErrorContext(
+			r.ctx, "failed to drain the speculative runners a previous configuration left behind")
+	}
+}
+
 // reapSpeculativeSurplus expires forecasts whose window has passed and removes
 // the capacity they left unclaimed.
 //
@@ -469,15 +502,27 @@ func (r *basePoolManager) claimSpeculativeRunnerForJob(job params.Job, candidate
 // on its own is real work, and the store query excludes it rather than relying
 // on this function to remember.
 //
-// This deliberately runs even when prewarming is disabled or paused: flipping
-// the kill switch must drain the runners already in flight, not strand them.
+// This deliberately keeps working while prewarming is paused: flipping the kill
+// switch must drain the runners already in flight, not strand them.
 func (r *basePoolManager) reapSpeculativeSurplus() error {
 	now := time.Now()
+	return r.reapSpeculativeSurplusExpiringBefore(now, now)
+}
+
+// drainSpeculativeSurplus reclaims every unclaimed speculative runner whatever
+// is left of its TTL. It is the shutdown path for the feature rather than its
+// housekeeping.
+func (r *basePoolManager) drainSpeculativeSurplus() error {
+	now := time.Now()
+	return r.reapSpeculativeSurplusExpiringBefore(now, now.Add(speculativeDrainHorizon))
+}
+
+func (r *basePoolManager) reapSpeculativeSurplusExpiringBefore(now, expiringBefore time.Time) error {
 	if _, err := r.store.ExpirePrewarmRequests(r.ctx, now); err != nil {
 		return fmt.Errorf("error expiring prewarm requests: %w", err)
 	}
 
-	reapable, err := r.store.ListReapableSpeculativeInstances(r.ctx, now)
+	reapable, err := r.store.ListReapableSpeculativeInstances(r.ctx, expiringBefore)
 	if err != nil {
 		return fmt.Errorf("error listing reapable speculative instances: %w", err)
 	}

@@ -2157,7 +2157,7 @@ func (r *basePoolManager) Start() error {
 		go r.startLoopForFunction(r.consumeQueuedJobs, common.PoolConsilitationInterval, "job_queue_consumer", false, r.queuedJobsTrigger)
 		go r.startLoopForFunction(r.reconcileStaleJobs, common.PoolStaleJobReconcileInterval, "stale_job_reconciler", false, nil)
 		go r.startLoopForFunction(r.reconcilePrewarm, common.PoolConsilitationInterval, "prewarm_reconciler", false, r.prewarmTrigger)
-		go r.startLoopForFunction(r.reapSpeculativeSurplus, common.PoolReapTimeoutInterval, "prewarm_reaper", false, nil)
+		go r.startSpeculativeReaper()
 	}()
 	return nil
 }
