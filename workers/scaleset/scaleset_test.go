@@ -337,16 +337,18 @@ func TestLateFailedCreationImmediatelyOpensReplacement(t *testing.T) {
 // cannot serve a job. Sizing the forecast off that alone orders the whole cohort
 // again on top of the one still running: measured on the bench rig at
 // current_runners=0 with ten machines up, nine seconds after the restart.
-func TestRestartDoesNotReorderSpeculativeRunnersStillBeingTornDown(t *testing.T) {
+func TestRestartDoesNotReorderRunnersStillBeingTornDown(t *testing.T) {
 	const cohort = 10
 	runners := make(map[string]params.Instance, cohort)
 	for i := range cohort {
-		id := fmt.Sprintf("speculative-%d", i)
+		id := fmt.Sprintf("interrupted-%d", i)
+		// Exactly what Start() leaves behind for a create the restart killed:
+		// forced from creating to pending_delete, never registered with GitHub,
+		// and — because this package never sets it — not marked speculative.
 		runners[id] = params.Instance{
 			ID:           id,
 			Status:       commonParams.InstancePendingDelete,
 			RunnerStatus: params.RunnerPending,
-			Speculative:  true,
 		}
 	}
 	w := &Worker{
@@ -369,13 +371,12 @@ func TestRestartDoesNotReorderSpeculativeRunnersStillBeingTornDown(t *testing.T)
 // Real demand is not held back. A runner assigned to a queued job that dies
 // mid-teardown still needs replacing right away, so only the speculative part of
 // the target is suppressed.
-func TestTornDownSpeculativeRunnersDoNotHoldBackAssignedWork(t *testing.T) {
+func TestTornDownRunnersDoNotHoldBackAssignedWork(t *testing.T) {
 	runners := map[string]params.Instance{
-		"speculative-0": {
-			ID:           "speculative-0",
+		"interrupted-0": {
+			ID:           "interrupted-0",
 			Status:       commonParams.InstancePendingDelete,
 			RunnerStatus: params.RunnerPending,
-			Speculative:  true,
 		},
 	}
 	w := &Worker{
@@ -385,6 +386,34 @@ func TestTornDownSpeculativeRunnersDoNotHoldBackAssignedWork(t *testing.T) {
 	}
 
 	if got, want := w.targetRunners(), 4; got != want {
+		t.Fatalf("target runners = %d, want %d", got, want)
+	}
+}
+
+// Ordinary churn is not an interrupted create. A runner that registered, went
+// idle and is now being reclaimed has already done its work, and the machine
+// behind it is on its way out for good — the forecast must keep its slot or
+// every scale-down would eat one warm runner from the next fanout.
+func TestReclaimedIdleRunnersDoNotHoldBackTheForecast(t *testing.T) {
+	runners := map[string]params.Instance{
+		"idle-0": {
+			ID:           "idle-0",
+			Status:       commonParams.InstancePendingDelete,
+			RunnerStatus: params.RunnerIdle,
+		},
+		"terminated-0": {
+			ID:           "terminated-0",
+			Status:       commonParams.InstanceDeleting,
+			RunnerStatus: params.RunnerTerminated,
+		},
+	}
+	w := &Worker{
+		scaleSet:           params.ScaleSet{Enabled: true, MaxRunners: 64},
+		runners:            runners,
+		speculativeRunners: 3,
+	}
+
+	if got, want := w.targetRunners(), 3; got != want {
 		t.Fatalf("target runners = %d, want %d", got, want)
 	}
 }
