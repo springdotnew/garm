@@ -27,10 +27,11 @@ const (
 	PrewarmRequestActive PrewarmRequestState = "active"
 	// PrewarmRequestExpired is a forecast whose TTL elapsed. Unclaimed
 	// capacity from it is reapable.
+	//
+	// There is deliberately no "completed" state. A forecast is consumed by
+	// having its remaining count drawn down, not by being marked finished, so a
+	// terminal state nothing writes would only invite a reader to filter on it.
 	PrewarmRequestExpired PrewarmRequestState = "expired"
-	// PrewarmRequestCompleted is a forecast whose demand has been fully
-	// observed.
-	PrewarmRequestCompleted PrewarmRequestState = "completed"
 )
 
 // PrewarmRequest is one matched prewarm rule: a prediction that a workflow

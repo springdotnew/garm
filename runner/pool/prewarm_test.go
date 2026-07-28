@@ -461,6 +461,57 @@ func (s *PrewarmPoolTestSuite) TestArmingSurvivesARestart() {
 		"a restarted controller must serve a forecast that was already armed")
 }
 
+// armFailsOnceStore fails the first arming and then behaves normally, which is
+// the shape of a transient database error.
+type armFailsOnceStore struct {
+	dbCommon.Store
+
+	mux    sync.Mutex
+	tried  bool
+	failed int
+}
+
+func (s *armFailsOnceStore) ArmPrewarmRequests(ctx context.Context, entityID string, triggerJobID int64, armedAt time.Time) error {
+	s.mux.Lock()
+	first := !s.tried
+	s.tried = true
+	if first {
+		s.failed++
+	}
+	s.mux.Unlock()
+
+	if first {
+		return fmt.Errorf("transient failure arming %d", triggerJobID)
+	}
+	return s.Store.ArmPrewarmRequests(ctx, entityID, triggerJobID, armedAt)
+}
+
+// A forecast whose arming fails has to be retried rather than forgotten. Failing
+// closed is the right direction — an unarmed forecast is simply not served — but
+// dropping it from the pending set as well would turn one transient database
+// error into a permanently cold fanout, with nothing in the logs a reader could
+// act on beyond the error itself.
+func (s *PrewarmPoolTestSuite) TestArmingIsRetriedAfterAFailure() {
+	failing := &armFailsOnceStore{Store: s.store}
+	s.mgr.store = failing
+
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.syncJobsFromDB()
+
+	s.Require().NoError(s.mgr.consumeQueuedJobs())
+	s.Equal(1, failing.failed, "the first arming has to actually fail, or this test proves nothing")
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+	s.Empty(s.speculativeInstances(), "a forecast whose arming failed must stay invisible")
+	s.Len(s.pendingPrewarmWakes(), 1, "a failed arming must stay pending so it can be retried")
+
+	s.Require().NoError(s.mgr.consumeQueuedJobs())
+	s.Empty(s.pendingPrewarmWakes(), "the retry has to clear it")
+
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+	s.Len(s.speculativeInstances(), prewarmTestCohortLen,
+		"the next pass must arm the forecast the failed one left behind")
+}
+
 func (s *PrewarmPoolTestSuite) TestDuplicateWebhookDeliveriesCreateOneCohort() {
 	gate := s.gateJob(1, 100)
 	for range 3 {
