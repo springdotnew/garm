@@ -682,6 +682,49 @@ func (s *PrewarmPoolTestSuite) TestKillSwitchStopsCreationWithoutAConfigChange()
 	s.True(s.mgr.prewarmCfg.Enable, "the kill switch must not need a config change")
 }
 
+// The switch is only a kill switch if it kills the right thing, and the test
+// above does not check that: asserting prewarmCfg.Enable is a statement about a
+// config field, not about whether CI still gets runners. The distinction is the
+// whole risk. An operator pulls this during an incident, and a switch that also
+// stops the ordinary queued-job path turns a capacity problem into an outage.
+func (s *PrewarmPoolTestSuite) TestKillSwitchLeavesRealQueuedJobsAlone() {
+	paused := true
+	updated, err := s.store.UpdateController(params.UpdateControllerParams{
+		PrewarmPaused: &paused,
+	})
+	s.Require().NoError(err)
+	s.Require().True(updated.PrewarmPaused)
+
+	s.mgr.mux.Lock()
+	// Take the flag, not the whole row. The stored controller carries a 30s
+	// MinimumJobAgeBackoff and the manager's copy does not, so adopting the row
+	// wholesale would park both jobs inside the backoff — and this test would
+	// then pass for the wrong reason: nothing created because nothing was due,
+	// rather than because the switch was thrown. The assertion below pins the
+	// precondition so a future change to either default fails here loudly.
+	s.Require().Zero(s.mgr.controllerInfo.MinimumJobAgeBackoff)
+	s.mgr.controllerInfo.PrewarmPaused = updated.PrewarmPaused
+	s.mgr.mux.Unlock()
+
+	// The gate job is what would have armed speculation and the fanout job is
+	// what speculation would have served. Paused, both are ordinary work and both
+	// have to be served as such.
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.workflowJob(2, 100, "build", prewarmTestWorkflow)))
+
+	s.syncJobsFromDB()
+	s.Require().NoError(s.mgr.consumeQueuedJobs())
+
+	instances := s.allInstances()
+	s.Require().Len(instances, 2, "both queued jobs must still be given a runner while prewarming is paused")
+	for _, instance := range instances {
+		s.False(instance.Speculative, "a paused controller must serve real jobs from the ordinary path")
+	}
+
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+	s.Empty(s.speculativeInstances(), "pausing has to hold across a reconcile too")
+}
+
 // Pausing is meant to be legible: an operator who has just pulled the emergency
 // switch reads the same gauge to confirm it took. One still reporting the last
 // forecast says capacity is on its way that nothing is going to create.
@@ -1031,9 +1074,13 @@ func (s *PrewarmPoolTestSuite) TestReapIsRecordedAgainstItsTarget() {
 	s.EqualValues(2, requests[0].Targets[0].ReapedCount)
 }
 
-// The reaper has to keep working after the kill switch is thrown, otherwise
-// pausing prewarm would strand the runners already in flight.
-func (s *PrewarmPoolTestSuite) TestReaperDrainsAfterThePrewarmIsPaused() {
+// The reaper has to keep working after prewarming is switched off in the
+// config, otherwise disabling it would strand the runners already in flight.
+//
+// Named for what it does. It used to be called ...AfterThePrewarmIsPaused,
+// which described the test below instead — a reader checking that the kill
+// switch drains would have found this, seen a green test, and moved on.
+func (s *PrewarmPoolTestSuite) TestReaperDrainsAfterPrewarmIsDisabled() {
 	s.prewarmWithExpiredCohort(1, 100)
 
 	s.mgr.prewarmCfg.Enable = false
@@ -1042,6 +1089,29 @@ func (s *PrewarmPoolTestSuite) TestReaperDrainsAfterThePrewarmIsPaused() {
 	for _, instance := range s.speculativeInstances() {
 		s.Equal(commonParams.InstancePendingDelete, instance.Status)
 	}
+}
+
+// And the same for the kill switch, which is a different control: the config
+// still says enable = true, only the controller row says paused.
+func (s *PrewarmPoolTestSuite) TestReaperDrainsAfterTheKillSwitchIsThrown() {
+	s.prewarmWithExpiredCohort(1, 100)
+
+	paused := true
+	updated, err := s.store.UpdateController(params.UpdateControllerParams{
+		PrewarmPaused: &paused,
+	})
+	s.Require().NoError(err)
+
+	s.mgr.mux.Lock()
+	s.mgr.controllerInfo = updated
+	s.mgr.mux.Unlock()
+
+	s.Require().NoError(s.mgr.reapSpeculativeSurplus())
+
+	for _, instance := range s.speculativeInstances() {
+		s.Equal(commonParams.InstancePendingDelete, instance.Status)
+	}
+	s.True(s.mgr.prewarmCfg.Enable, "the kill switch must not need a config change")
 }
 
 // A scale set target looks like this from the pool manager: a label set no
