@@ -59,6 +59,20 @@ var speculativeClaimableRunnerStatuses = []params.RunnerStatus{
 	params.RunnerIdle,
 }
 
+// speculativeUnreclaimedStatuses are the states a speculative runner is left in
+// once its create has been interrupted or has failed. The row will never serve a
+// job, so it is deliberately not claimable — but the machine it asked the
+// provider for is very often still running, and it stays that way until the
+// delete lands. A controller that comes back up in the middle of a cohort sees a
+// whole cohort's worth of these, and if they do not count as capacity it buys a
+// second machine for every slot whose first machine is still being torn down.
+var speculativeUnreclaimedStatuses = []commonParams.InstanceStatus{
+	commonParams.InstanceError,
+	commonParams.InstancePendingDelete,
+	commonParams.InstancePendingForceDelete,
+	commonParams.InstanceDeleting,
+}
+
 // CreatePrewarmRequest inserts a prewarm request and its targets. The insert is
 // deduplicated on (entity, repository, workflow, run, attempt, rule): a
 // duplicate webhook delivery returns the existing request with created=false
@@ -432,14 +446,24 @@ func (s *sqlDatabase) CountSpeculativeInstances(_ context.Context) (int64, error
 	return count, nil
 }
 
-// CountPoolAvailableCapacity counts the runners of a pool that are provably
-// uncommitted, so the prewarm reconciler never stacks speculative capacity on
-// top of capacity that already exists.
+// CountPoolAvailableCapacity counts the runners of a pool the prewarm
+// reconciler must not buy a second machine for, so a forecast never stacks
+// speculative capacity on top of capacity that already exists.
 //
-// Two kinds of runner qualify:
+// Three kinds of runner qualify:
 //
-//   - a speculative runner nobody has claimed, at any stage of its boot; and
-//   - an ordinary runner that has finished booting and is sitting idle.
+//   - a speculative runner nobody has claimed, at any stage of its boot;
+//   - an ordinary runner that has finished booting and is sitting idle; and
+//   - a speculative runner whose create was interrupted or failed and whose
+//     machine has not been reclaimed yet.
+//
+// The third kind is the one that is easy to get wrong. Those rows are useless —
+// no job will ever be told to wait for one — so the instinct is to replace them
+// immediately. But the provider machine behind them usually still exists, and
+// replacing them before it is gone doubles the cohort. Counting them here holds
+// the purchase until the delete lands; the next reconcile pass sees the deficit
+// again and buys then, if the forecast window is still open. Under-prewarming
+// for one pass costs a cold boot. Over-prewarming costs a VM nobody reaps.
 //
 // An ordinary runner that is still booting does not qualify. GARM creates those
 // in response to a specific queued job, so counting them would let the job that
@@ -454,7 +478,9 @@ func (s *sqlDatabase) CountPoolAvailableCapacity(_ context.Context, poolID strin
 		Where("speculative = ? AND reserved_for_workflow_job_id IS NULL AND status IN ? AND runner_status IN ?",
 			true, speculativeClaimableStatuses, speculativeClaimableRunnerStatuses).
 		Or("speculative = ? AND status = ? AND runner_status = ?",
-			false, commonParams.InstanceRunning, params.RunnerIdle)
+			false, commonParams.InstanceRunning, params.RunnerIdle).
+		Or("speculative = ? AND reserved_for_workflow_job_id IS NULL AND status IN ?",
+			true, speculativeUnreclaimedStatuses)
 
 	var count int64
 	q := s.conn.Model(&Instance{}).
