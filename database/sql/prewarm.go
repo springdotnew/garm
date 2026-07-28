@@ -97,6 +97,7 @@ func (s *sqlDatabase) CreatePrewarmRequest(ctx context.Context, param params.Cre
 			Mode:         param.Mode,
 			State:        string(param.State),
 			ExpiresAt:    param.ExpiresAt,
+			ArmedAt:      param.ArmedAt,
 		}
 		if err := tx.Create(&request).Error; err != nil {
 			return fmt.Errorf("error creating prewarm request: %w", err)
@@ -158,6 +159,7 @@ func (s *sqlDatabase) ListActivePrewarmRequests(_ context.Context, entityID stri
 	q := s.conn.Preload("Targets").
 		Where("entity_id = ? AND state IN ?", asUUID,
 			[]string{string(params.PrewarmRequestShadow), string(params.PrewarmRequestActive)}).
+		Where("armed_at IS NOT NULL").
 		Order("created_at desc").
 		Find(&requests)
 	if q.Error != nil {
@@ -175,13 +177,39 @@ func (s *sqlDatabase) ListActivePrewarmRequests(_ context.Context, entityID stri
 	return ret, nil
 }
 
+// ArmPrewarmRequests makes a gate job's forecasts servable. It is called once
+// the queued-job consumer has dealt with that job, which is the moment a
+// forecast stops being able to outrank the work that produced it.
+//
+// Already-armed rows are left alone rather than re-stamped: the arming time is
+// evidence of when the ordering was satisfied, and a duplicate delivery or a
+// second consumer pass should not rewrite it.
+func (s *sqlDatabase) ArmPrewarmRequests(_ context.Context, entityID string, triggerJobID int64, armedAt time.Time) error {
+	asUUID, err := uuid.Parse(entityID)
+	if err != nil {
+		return fmt.Errorf("error parsing entity id: %w", err)
+	}
+
+	q := s.conn.Model(&PrewarmRequest{}).
+		Where("entity_id = ? AND trigger_job_id = ?", asUUID, triggerJobID).
+		Where("armed_at IS NULL").
+		Update("armed_at", armedAt)
+	if q.Error != nil {
+		return fmt.Errorf("error arming prewarm requests: %w", q.Error)
+	}
+	return nil
+}
+
 // SumRemainingPrewarmForecast returns how much of the forecast for a label set
 // is still unmet across an entity's live requests.
 //
 // Shadow requests are excluded — they record what would have happened without
 // creating anything — and so are requests whose window has closed but whose
 // state the reaper has not flipped yet, so a stale forecast can never hold
-// capacity open past its expiry.
+// capacity open past its expiry. Unarmed requests are excluded too: this is the
+// scale-set worker's only view of the forecast, and it autoscales off a ticker
+// that knows nothing about the gate job, so the predicate here is what stops it
+// creating capacity before the gate has been served.
 func (s *sqlDatabase) SumRemainingPrewarmForecast(_ context.Context, entityID, labelKey string) (uint, error) {
 	asUUID, err := uuid.Parse(entityID)
 	if err != nil {
@@ -198,6 +226,7 @@ func (s *sqlDatabase) SumRemainingPrewarmForecast(_ context.Context, entityID, l
 	q := s.conn.Model(&PrewarmRequest{}).
 		Where("entity_id = ? AND state = ?", asUUID, string(params.PrewarmRequestActive)).
 		Where("expires_at > ?", time.Now()).
+		Where("armed_at IS NOT NULL").
 		Find(&requests)
 	if q.Error != nil {
 		return 0, fmt.Errorf("error looking up prewarm requests: %w", q.Error)
@@ -529,6 +558,7 @@ func sqlToParamsPrewarmRequest(request PrewarmRequest) (params.PrewarmRequest, e
 		CreatedAt:    request.CreatedAt,
 		UpdatedAt:    request.UpdatedAt,
 		ExpiresAt:    request.ExpiresAt,
+		ArmedAt:      request.ArmedAt,
 		Targets:      make([]params.PrewarmRequestTarget, 0, len(request.Targets)),
 	}
 

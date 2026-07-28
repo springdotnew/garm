@@ -2410,6 +2410,55 @@ func (_c *Store_DeleteTemplate_Call) RunAndReturn(run func(context.Context, uint
 	return _c
 }
 
+// ArmPrewarmRequests provides a mock function with given fields: ctx, entityID, triggerJobID, armedAt
+func (_m *Store) ArmPrewarmRequests(ctx context.Context, entityID string, triggerJobID int64, armedAt time.Time) error {
+	ret := _m.Called(ctx, entityID, triggerJobID, armedAt)
+
+	if len(ret) == 0 {
+		panic("no return value specified for ArmPrewarmRequests")
+	}
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func(context.Context, string, int64, time.Time) error); ok {
+		r0 = rf(ctx, entityID, triggerJobID, armedAt)
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
+// Store_ArmPrewarmRequests_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'ArmPrewarmRequests'
+type Store_ArmPrewarmRequests_Call struct {
+	*mock.Call
+}
+
+// ArmPrewarmRequests is a helper method to define mock.On call
+//   - ctx context.Context
+//   - entityID string
+//   - triggerJobID int64
+//   - armedAt time.Time
+func (_e *Store_Expecter) ArmPrewarmRequests(ctx interface{}, entityID interface{}, triggerJobID interface{}, armedAt interface{}) *Store_ArmPrewarmRequests_Call {
+	return &Store_ArmPrewarmRequests_Call{Call: _e.mock.On("ArmPrewarmRequests", ctx, entityID, triggerJobID, armedAt)}
+}
+
+func (_c *Store_ArmPrewarmRequests_Call) Run(run func(ctx context.Context, entityID string, triggerJobID int64, armedAt time.Time)) *Store_ArmPrewarmRequests_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(string), args[2].(int64), args[3].(time.Time))
+	})
+	return _c
+}
+
+func (_c *Store_ArmPrewarmRequests_Call) Return(_a0 error) *Store_ArmPrewarmRequests_Call {
+	_c.Call.Return(_a0)
+	return _c
+}
+
+func (_c *Store_ArmPrewarmRequests_Call) RunAndReturn(run func(context.Context, string, int64, time.Time) error) *Store_ArmPrewarmRequests_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // ExpirePrewarmRequests provides a mock function with given fields: ctx, now
 func (_m *Store) ExpirePrewarmRequests(ctx context.Context, now time.Time) (int64, error) {
 	ret := _m.Called(ctx, now)

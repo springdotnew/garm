@@ -234,7 +234,7 @@ func (s *PrewarmPoolTestSuite) prewarmWithExpiredCohort(jobID, runID int64) []pa
 	s.T().Helper()
 
 	s.mgr.prewarmCfg.DefaultTTL = prewarmTestBriefTTL
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(jobID, runID)))
+	s.recordGateJob(jobID, runID)
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 
 	speculative := s.speculativeInstances()
@@ -284,6 +284,29 @@ func (s *PrewarmPoolTestSuite) pendingPrewarmWakes() map[int64]struct{} {
 	return pending
 }
 
+// recordGateJob delivers a gate job's webhook and then arms the forecast it
+// produced, which together are what actually happens in production: the webhook
+// records the forecast, and the queued-job consumer arms it once it has given
+// that job a runner.
+//
+// Tests that care about the window *between* those two steps — a forecast that
+// exists but is not yet servable — call HandleWorkflowJob directly and do not
+// arm. That window is the whole ordering guarantee, so it is worth being able to
+// write both.
+func (s *PrewarmPoolTestSuite) recordGateJob(jobID, runID int64) {
+	s.T().Helper()
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(jobID, runID)))
+	s.armForecastsFor(jobID)
+}
+
+// armForecastsFor does what the consumer's deferred release does, without
+// needing a full consume pass.
+func (s *PrewarmPoolTestSuite) armForecastsFor(triggerJobID int64) {
+	s.T().Helper()
+	s.Require().NoError(
+		s.store.ArmPrewarmRequests(s.adminCtx, s.entity.ID, triggerJobID, time.Now()))
+}
+
 // syncJobsFromDB mirrors what the watcher does for the queued-job consumer.
 func (s *PrewarmPoolTestSuite) syncJobsFromDB() {
 	allJobs, err := s.store.ListAllJobs(s.adminCtx)
@@ -300,7 +323,7 @@ func (s *PrewarmPoolTestSuite) syncJobsFromDB() {
 }
 
 func (s *PrewarmPoolTestSuite) TestGateJobPrewarmsTheForecastCohort() {
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 
 	requests, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
 	s.Require().NoError(err)
@@ -317,7 +340,7 @@ func (s *PrewarmPoolTestSuite) TestGateJobPrewarmsTheForecastCohort() {
 // The gate job is real work. It must be served by the ordinary queued-job path
 // before any speculation happens, never out of the cohort it just forecast.
 func (s *PrewarmPoolTestSuite) TestGateJobIsServedBeforeSpeculation() {
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 
 	s.syncJobsFromDB()
 	s.Require().NoError(s.mgr.consumeQueuedJobs())
@@ -342,17 +365,28 @@ func (s *PrewarmPoolTestSuite) TestSpeculationWaitsForTheGateJobsPass() {
 	s.mgr.controllerInfo.MinimumJobAgeBackoff = 3600
 	s.mgr.mux.Unlock()
 
+	// Deliberately not recordGateJob: this test is about the window before the
+	// forecast is armed, so arming it up front would assert nothing.
 	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
 
 	s.Empty(s.mgr.prewarmTrigger, "recording a forecast must not wake speculation by itself")
 	s.Len(s.pendingPrewarmWakes(), 1, "the forecast should be waiting on its gate job")
 
+	// The wake is only an optimisation, so the guarantee cannot rest on it. A
+	// reconcile that fires for any other reason — the free-running consolidation
+	// ticker, another entity's wake — must still create nothing.
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+	s.Empty(s.speculativeInstances(), "an unarmed forecast must be invisible to the reconcile loop")
+
 	// A pass that sees the gate job but leaves it inside its backoff has not
-	// served it, so the wake stays armed.
+	// served it, so the forecast stays unarmed.
 	s.syncJobsFromDB()
 	s.Require().NoError(s.mgr.consumeQueuedJobs())
 	s.Empty(s.mgr.prewarmTrigger, "speculation must not be woken while the gate job is still backed off")
 	s.Len(s.pendingPrewarmWakes(), 1)
+
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+	s.Empty(s.speculativeInstances(), "a backed-off gate job must not release its own forecast")
 
 	// The pass that reaches the job releases it.
 	s.mgr.mux.Lock()
@@ -371,7 +405,7 @@ func (s *PrewarmPoolTestSuite) TestSpeculationWaitsForTheGateJobsPass() {
 // A forecast whose trigger job never comes back — a cancelled run, a job that
 // completed while the webhook was in flight — must not pin speculation forever.
 func (s *PrewarmPoolTestSuite) TestForecastIsReleasedWhenTheGateJobVanishes() {
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 	s.Require().Len(s.pendingPrewarmWakes(), 1)
 
 	// The consumer sees an empty queue: whatever happened to the job, it is not
@@ -387,11 +421,52 @@ func (s *PrewarmPoolTestSuite) TestForecastIsReleasedWhenTheGateJobVanishes() {
 	s.Len(s.mgr.prewarmTrigger, 1)
 }
 
+// The scale-set worker never sees the pool manager's wake map — it autoscales
+// off its own ticker, reading SumRemainingPrewarmForecast straight from the
+// store. That is how a live controller scheduled ten scale-set creations 1.462s
+// *before* the gate job's runner was reserved, on a binary whose pool half was
+// correctly ordered. The guarantee therefore has to live in the row, and this
+// pins the query the scale set actually calls.
+func (s *PrewarmPoolTestSuite) TestScaleSetForecastIsInvisibleUntilArmed() {
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+
+	target := s.mgr.prewarmCfg.Rules[0].Targets[0]
+	labelKey := target.LabelKey()
+
+	requests, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
+	s.Require().NoError(err)
+	s.Require().Empty(requests, "an unarmed forecast must not be listed as active")
+
+	remaining, err := s.store.SumRemainingPrewarmForecast(s.adminCtx, s.entity.ID, labelKey)
+	s.Require().NoError(err)
+	s.Zero(remaining, "scale sets must see no forecast before it is armed")
+
+	s.armForecastsFor(1)
+
+	remaining, err = s.store.SumRemainingPrewarmForecast(s.adminCtx, s.entity.ID, labelKey)
+	s.Require().NoError(err)
+	s.EqualValues(prewarmTestCohortLen, remaining,
+		"arming has to make the whole forecast visible, or this test proves nothing")
+}
+
+// Arming is a store write precisely so it survives the process that made it. A
+// controller that dies after arming must resume serving the cohort rather than
+// stranding it.
+func (s *PrewarmPoolTestSuite) TestArmingSurvivesARestart() {
+	s.recordGateJob(1, 100)
+
+	restarted := s.newPoolManager()
+	s.Require().NoError(restarted.reconcilePrewarm())
+	s.Len(s.speculativeInstances(), prewarmTestCohortLen,
+		"a restarted controller must serve a forecast that was already armed")
+}
+
 func (s *PrewarmPoolTestSuite) TestDuplicateWebhookDeliveriesCreateOneCohort() {
 	gate := s.gateJob(1, 100)
 	for range 3 {
 		s.Require().NoError(s.mgr.HandleWorkflowJob(gate))
 	}
+	s.armForecastsFor(1)
 
 	requests, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
 	s.Require().NoError(err)
@@ -414,6 +489,7 @@ func (s *PrewarmPoolTestSuite) TestConcurrentWebhookDeliveriesCreateOneCohort() 
 		}()
 	}
 	wg.Wait()
+	s.armForecastsFor(1)
 
 	requests, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
 	s.Require().NoError(err)
@@ -435,7 +511,7 @@ func (s *PrewarmPoolTestSuite) TestExistingCapacityReducesTheDeficit() {
 		s.Require().NoError(err)
 	}
 
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 
 	s.Len(s.speculativeInstances(), prewarmTestCohortLen-2)
@@ -443,7 +519,7 @@ func (s *PrewarmPoolTestSuite) TestExistingCapacityReducesTheDeficit() {
 }
 
 func (s *PrewarmPoolTestSuite) TestReconcileIsIdempotent() {
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 
 	for range 3 {
 		s.Require().NoError(s.mgr.reconcilePrewarm())
@@ -455,7 +531,7 @@ func (s *PrewarmPoolTestSuite) TestReconcileIsIdempotent() {
 func (s *PrewarmPoolTestSuite) TestShadowModeCreatesNoRunners() {
 	s.mgr.prewarmCfg = s.prewarmConfig(config.PrewarmModeShadow)
 
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 
 	requests, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
 	s.Require().NoError(err)
@@ -489,7 +565,7 @@ func (s *PrewarmPoolTestSuite) TestForecastIsRenderedForTheRequestLogLine() {
 func (s *PrewarmPoolTestSuite) TestShadowModePublishesTheForecastItWouldHaveActedOn() {
 	s.mgr.prewarmCfg = s.prewarmConfig(config.PrewarmModeShadow)
 
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 
 	s.Empty(s.allInstances())
@@ -518,7 +594,7 @@ func (s *PrewarmPoolTestSuite) targetRunnersMetric(labelKey, poolID string) floa
 func (s *PrewarmPoolTestSuite) TestExpiredForecastCreatesNothing() {
 	s.mgr.prewarmCfg.DefaultTTL = prewarmTestBriefTTL
 
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 	time.Sleep(prewarmTestPastTTL)
 
 	requests, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
@@ -540,7 +616,7 @@ func (s *PrewarmPoolTestSuite) TestForecastGaugeFallsBackToZeroWhenTheWindowClos
 	s.mgr.prewarmCfg.DefaultTTL = prewarmTestBriefTTL
 	labelKey := config.NormalizeLabelKey(prewarmTestLabels)
 
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 	s.Require().EqualValues(prewarmTestCohortLen, s.targetRunnersMetric(labelKey, s.pool.ID))
 
@@ -559,7 +635,7 @@ func (s *PrewarmPoolTestSuite) TestForecastGaugeFallsBackToZeroOnceTheRequestIsR
 	s.mgr.prewarmCfg.DefaultTTL = prewarmTestBriefTTL
 	labelKey := config.NormalizeLabelKey(prewarmTestLabels)
 
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 	s.Require().EqualValues(prewarmTestCohortLen, s.targetRunnersMetric(labelKey, s.pool.ID))
 
@@ -577,7 +653,7 @@ func (s *PrewarmPoolTestSuite) TestForecastGaugeFallsBackToZeroOnceTheRequestIsR
 func (s *PrewarmPoolTestSuite) TestDisabledPrewarmIsANoOp() {
 	s.mgr.prewarmCfg = config.Prewarm{}
 
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 
 	requests, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
 	s.Require().NoError(err)
@@ -622,7 +698,7 @@ func (s *PrewarmPoolTestSuite) TestDisabledPrewarmStartsNoReapLoop() {
 // runners are nowhere near their expiry and no job will ever claim them again,
 // so waiting the TTL out is time nobody uses and money nobody gets back.
 func (s *PrewarmPoolTestSuite) TestDisablingPrewarmDrainsTheRunnersItLeftBehind() {
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 	for _, instance := range s.speculativeInstances() {
 		s.Require().NotNil(instance.SpeculativeExpiresAt)
@@ -643,7 +719,7 @@ func (s *PrewarmPoolTestSuite) TestDisablingPrewarmDrainsTheRunnersItLeftBehind(
 // return and leave it billing. The pool manager not being running yet is the
 // real case: removal is refused until the entity's first tools update lands.
 func (s *PrewarmPoolTestSuite) TestDrainReportsRunnersItCouldNotReclaim() {
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 	s.Require().Len(s.speculativeInstances(), prewarmTestCohortLen)
 
@@ -664,7 +740,7 @@ func (s *PrewarmPoolTestSuite) TestDrainReportsRunnersItCouldNotReclaim() {
 }
 
 func (s *PrewarmPoolTestSuite) TestKillSwitchStopsCreationWithoutAConfigChange() {
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 
 	paused := true
 	updated, err := s.store.UpdateController(params.UpdateControllerParams{
@@ -709,7 +785,7 @@ func (s *PrewarmPoolTestSuite) TestKillSwitchLeavesRealQueuedJobsAlone() {
 	// The gate job is what would have armed speculation and the fanout job is
 	// what speculation would have served. Paused, both are ordinary work and both
 	// have to be served as such.
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 	s.Require().NoError(s.mgr.HandleWorkflowJob(s.workflowJob(2, 100, "build", prewarmTestWorkflow)))
 
 	s.syncJobsFromDB()
@@ -731,7 +807,7 @@ func (s *PrewarmPoolTestSuite) TestKillSwitchLeavesRealQueuedJobsAlone() {
 func (s *PrewarmPoolTestSuite) TestKillSwitchTakesTheForecastGaugeDown() {
 	labelKey := config.NormalizeLabelKey(prewarmTestLabels)
 
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 	s.Require().EqualValues(prewarmTestCohortLen, s.targetRunnersMetric(labelKey, s.pool.ID))
 
@@ -752,13 +828,13 @@ func (s *PrewarmPoolTestSuite) TestKillSwitchTakesTheForecastGaugeDown() {
 func (s *PrewarmPoolTestSuite) TestGlobalCapBoundsTheCohort() {
 	s.mgr.prewarmCfg.MaxSpeculativeRunners = 2
 
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 
 	s.Len(s.speculativeInstances(), 2)
 
 	// A second run must not push past the cap either.
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(2, 200)))
+	s.recordGateJob(2, 200)
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 	s.Len(s.speculativeInstances(), 2)
 }
@@ -796,7 +872,7 @@ func (s *PrewarmPoolTestSuite) TestCohortReservesConcurrently() {
 		{Labels: prewarmTestLabels, Count: cohort},
 	}
 
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 
 	reconciled := make(chan error, 1)
 	go func() { reconciled <- s.mgr.reconcilePrewarm() }()
@@ -840,7 +916,7 @@ func (s *PrewarmPoolTestSuite) TestCohortStopsAtTheMaxRunnersCeiling() {
 		{Labels: cappedLabels, Count: 4 * ceiling},
 	}
 
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 
 	instances, err := s.store.ListPoolInstances(s.adminCtx, capped.ID, false)
@@ -876,7 +952,7 @@ func (s *PrewarmPoolTestSuite) TestGlobalCapBindsAcrossConcurrentTargets() {
 	}
 	s.mgr.prewarmCfg = cfg
 
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 
 	total, err := s.store.CountSpeculativeInstances(s.adminCtx)
@@ -902,7 +978,7 @@ func (s *PrewarmPoolTestSuite) TestRestartMidCohortResumesWithoutDuplicating() {
 	const interrupted = prewarmTestCohortLen / 2
 	s.mgr.prewarmCfg.MaxSpeculativeRunners = interrupted
 
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 	s.Require().Len(s.speculativeInstances(), interrupted)
 
@@ -917,15 +993,15 @@ func (s *PrewarmPoolTestSuite) TestRestartMidCohortResumesWithoutDuplicating() {
 }
 
 func (s *PrewarmPoolTestSuite) TestOverlappingRunsShareCapacity() {
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(2, 200)))
+	s.recordGateJob(1, 100)
+	s.recordGateJob(2, 200)
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 
 	s.Len(s.speculativeInstances(), 2*prewarmTestCohortLen)
 }
 
 func (s *PrewarmPoolTestSuite) TestQueuedFanoutJobClaimsPrewarmedCapacity() {
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 	s.Require().Len(s.speculativeInstances(), prewarmTestCohortLen)
 
@@ -950,7 +1026,7 @@ func (s *PrewarmPoolTestSuite) TestQueuedFanoutJobClaimsPrewarmedCapacity() {
 // Each queued job consumes one unit of the forecast made for it, so the fanout
 // GitHub actually queues shrinks the speculation rather than adding to it.
 func (s *PrewarmPoolTestSuite) TestQueuedFanoutConsumesTheForecast() {
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 
 	for jobID := int64(2); jobID <= 3; jobID++ {
 		s.Require().NoError(s.mgr.HandleWorkflowJob(s.workflowJob(jobID, 100, "build", prewarmTestWorkflow)))
@@ -968,7 +1044,7 @@ func (s *PrewarmPoolTestSuite) TestQueuedFanoutConsumesTheForecast() {
 }
 
 func (s *PrewarmPoolTestSuite) TestScaleDownLeavesLiveSpeculativeRunnersAlone() {
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 
 	for _, instance := range s.speculativeInstances() {
@@ -984,7 +1060,7 @@ func (s *PrewarmPoolTestSuite) TestScaleDownLeavesLiveSpeculativeRunnersAlone() 
 }
 
 func (s *PrewarmPoolTestSuite) TestReaperLeavesUnexpiredRunnersAlone() {
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 	s.Require().Len(s.speculativeInstances(), prewarmTestCohortLen)
 
@@ -1044,7 +1120,7 @@ func (s *PrewarmPoolTestSuite) TestReaperNeverRemovesAClaimedRunner() {
 // speculative runner carries no additional labels of its own, so the only
 // honest source for that is the pool it lives in.
 func (s *PrewarmPoolTestSuite) TestReapIsRecordedAgainstItsTarget() {
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 
 	requests, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
 	s.Require().NoError(err)
@@ -1124,7 +1200,7 @@ func (s *PrewarmPoolTestSuite) TestTargetThatAddressesNoPoolIsLeftToItsOwner() {
 	}
 	s.mgr.prewarmCfg = cfg
 
-	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.recordGateJob(1, 100)
 
 	requests, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
 	s.Require().NoError(err)

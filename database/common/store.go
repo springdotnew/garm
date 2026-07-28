@@ -232,6 +232,12 @@ type PrewarmStore interface {
 	// duplicate webhook delivery gets false and the existing cohort.
 	CreatePrewarmRequest(ctx context.Context, param params.CreatePrewarmRequestParams) (params.PrewarmRequest, bool, error)
 	ListActivePrewarmRequests(ctx context.Context, entityID string) ([]params.PrewarmRequest, error)
+	// ArmPrewarmRequests marks every unarmed forecast produced by a gate job as
+	// servable, and is called once the queued-job consumer has dealt with that
+	// job. Forecasts stay invisible to ListActivePrewarmRequests and
+	// SumRemainingPrewarmForecast until then, so no speculative reader — pool
+	// ticker, pool wake, or scale-set autoscale — can outrun the gate.
+	ArmPrewarmRequests(ctx context.Context, entityID string, triggerJobID int64, armedAt time.Time) error
 	// SumRemainingPrewarmForecast returns how much forecast for a label set is
 	// still unmet across an entity's live requests. Scale sets converge on a
 	// runner count rather than reserving per job, so this is all they need.

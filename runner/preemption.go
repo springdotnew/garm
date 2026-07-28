@@ -97,6 +97,12 @@ func (r *Runner) ReportInstancePreempted(ctx context.Context) error {
 	// The retry is the next attempt of the same run. Recording the forecast
 	// against that attempt is what lets the ordinary consumption path shrink it
 	// when the retry is finally queued.
+	//
+	// Armed at creation, unlike a gate job's forecast. Arming exists to stop a
+	// forecast racing the job that produced it; here that job was dispatched
+	// long ago and has just lost its runner, so there is nothing to wait behind
+	// and waiting would only delay the replacement.
+	armedAt := time.Now()
 	createParams := params.CreatePrewarmRequestParams{
 		EntityID:     entity.ID,
 		EntityType:   string(entity.EntityType),
@@ -109,6 +115,7 @@ func (r *Runner) ReportInstancePreempted(ctx context.Context) error {
 		Mode:         string(r.config.Prewarm.Mode),
 		State:        params.PrewarmRequestActive,
 		ExpiresAt:    time.Now().Add(r.config.Prewarm.Preemption.Duration()),
+		ArmedAt:      &armedAt,
 		Targets: []params.CreatePrewarmTargetParams{{
 			LabelKey:    config.NormalizeLabelKey(replacement),
 			Labels:      replacement,

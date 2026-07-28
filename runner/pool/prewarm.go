@@ -160,43 +160,66 @@ func (r *basePoolManager) createPrewarmRequest(ctx context.Context, job params.J
 	return nil
 }
 
-// deferPrewarmReconcile arms a wake that the queued-job consumer releases once
-// it has dealt with the trigger job.
+// deferPrewarmReconcile notes that a forecast is waiting on its trigger job, so
+// the queued-job consumer can wake speculation the moment it is done with that
+// job.
 //
-// Nothing is lost if the release never comes: the reconcile loop runs on the
-// consolidation interval regardless, so the worst case is that a forecast is
-// serviced on the next tick instead of immediately. That is the right way round
-// — late speculation costs a few seconds of head start, early speculation
-// competes with the job that asked for it.
+// The wake is only an optimisation. What actually holds speculation back is the
+// row's `armed_at`, which stays NULL until releasePrewarmWakes stamps it, and
+// which every speculative reader filters on. An earlier version relied on this
+// map alone and was wrong in two directions at once: the reconcile loop also
+// runs on a free-running consolidation ticker that never consults the map, and
+// the scale-set worker autoscales from the store in a different goroutine that
+// cannot see it at all. Live, the scale set speculated 1.462s ahead of the gate.
 func (r *basePoolManager) deferPrewarmReconcile(triggerJobID int64) {
 	r.pendingPrewarmWakesMux.Lock()
 	r.pendingPrewarmWakes[triggerJobID] = struct{}{}
 	r.pendingPrewarmWakesMux.Unlock()
 }
 
-// releasePrewarmWakesExcept wakes speculation for every forecast whose trigger
-// job the caller has finished with, and leaves the rest armed.
+// releasePrewarmWakesExcept arms every forecast whose trigger job the caller has
+// finished with, and leaves the rest unarmed.
 //
 // `stillWaiting` is the set of jobs the pass saw but deliberately did not serve
 // yet — today that is the job backoff, which is exactly the window this whole
 // mechanism exists to sit behind. A trigger job that is absent from the queue
-// entirely is released rather than kept: its run may have been cancelled, and a
+// entirely is armed rather than held: its run may have been cancelled, and a
 // forecast pinned to a job that is never coming back would be pinned forever.
+//
+// Arming is a store write, so it survives a restart: a controller that dies
+// after arming resumes serving the cohort, and one that dies before arming
+// leaves the forecast unservable until it expires. That asymmetry is deliberate
+// — a cohort that never gets built costs a cold fanout, one built ahead of its
+// gate competes with it.
 func (r *basePoolManager) releasePrewarmWakesExcept(stillWaiting map[int64]struct{}) {
 	r.pendingPrewarmWakesMux.Lock()
-	released := false
+	released := make([]int64, 0, len(r.pendingPrewarmWakes))
 	for jobID := range r.pendingPrewarmWakes {
 		if _, waiting := stillWaiting[jobID]; waiting {
 			continue
 		}
 		delete(r.pendingPrewarmWakes, jobID)
-		released = true
+		released = append(released, jobID)
 	}
 	r.pendingPrewarmWakesMux.Unlock()
 
-	if released {
-		r.triggerPrewarmReconcile()
+	if len(released) == 0 {
+		return
 	}
+
+	armedAt := time.Now()
+	for _, jobID := range released {
+		if err := r.store.ArmPrewarmRequests(r.ctx, r.entity.ID, jobID, armedAt); err != nil {
+			// Leaving it unarmed is the safe failure: the forecast simply is not
+			// served. Waking the reconciler anyway would be pointless, but it is
+			// also harmless, and the next pass retries the arming.
+			slog.With(slog.Any("error", err)).ErrorContext(
+				r.ctx, "failed to arm prewarm requests",
+				"trigger_job_id", jobID)
+		}
+	}
+
+	r.triggerPrewarmReconcile()
 }
 
 // formatForecast renders a rule's targets as "label=count" pairs, in the order
