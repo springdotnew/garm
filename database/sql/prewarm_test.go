@@ -109,6 +109,21 @@ func (s *PrewarmTestSuite) createRequestParams() params.CreatePrewarmRequestPara
 	}
 }
 
+// armRequests makes the suite's forecasts servable, which is what the pool
+// manager does once the gate job that produced them has been given a runner.
+//
+// Every read path below filters unarmed rows out, so a test that skips this sees
+// nothing. That is the ordering guarantee, not an inconvenience: it is what stops
+// the scale-set autoscaler — which reads the store on its own ticker and cannot
+// see any of the pool manager's in-process state — from creating capacity ahead
+// of the job that asked for it. TestUnarmedRequestIsInvisible covers the other
+// side of it directly.
+func (s *PrewarmTestSuite) armRequests() {
+	s.T().Helper()
+	s.Require().NoError(s.store.ArmPrewarmRequests(
+		s.adminCtx, s.entity.ID, s.createRequestParams().TriggerJobID, time.Now()))
+}
+
 // queueJob records a queued job for the suite's run. Consumption is claimed
 // against the job row, so a job has to exist before it can consume anything.
 func (s *PrewarmTestSuite) queueJob(workflowJobID int64) params.Job {
@@ -188,9 +203,60 @@ func (s *PrewarmTestSuite) TestDuplicateDeliveryCreatesOneRequest() {
 	s.Require().Equal(first.ID, second.ID)
 	s.Require().Len(second.Targets, 2, "targets must not be duplicated either")
 
+	s.armRequests()
 	active, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
 	s.Require().NoError(err)
 	s.Require().Len(active, 1)
+}
+
+// The other half of the arming contract: a forecast that exists but has not been
+// released by the gate job's pass is invisible to both read paths. The pool
+// manager's reconcile uses the first and the scale-set autoscaler uses the
+// second, so this one predicate is what orders every speculative creator behind
+// the job that produced the forecast.
+func (s *PrewarmTestSuite) TestUnarmedRequestIsInvisible() {
+	_, created, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
+	s.Require().NoError(err)
+	s.Require().True(created)
+
+	active, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
+	s.Require().NoError(err)
+	s.Empty(active, "an unarmed forecast must not be listed as active")
+
+	remaining, err := s.store.SumRemainingPrewarmForecast(s.adminCtx, s.entity.ID, spotLabelKey)
+	s.Require().NoError(err)
+	s.Zero(remaining, "an unarmed forecast must not raise a scale-set target")
+
+	s.armRequests()
+
+	active, err = s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
+	s.Require().NoError(err)
+	s.Require().Len(active, 1, "arming must make it visible, or this test proves nothing")
+	s.Require().NotNil(active[0].ArmedAt)
+
+	remaining, err = s.store.SumRemainingPrewarmForecast(s.adminCtx, s.entity.ID, spotLabelKey)
+	s.Require().NoError(err)
+	s.Equal(uint(5), remaining)
+}
+
+// Arming is idempotent and does not rewrite the original stamp: the time a
+// forecast became servable is evidence about the ordering, and a duplicate
+// delivery or a second consumer pass must not move it.
+func (s *PrewarmTestSuite) TestArmingIsIdempotent() {
+	_, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
+	s.Require().NoError(err)
+
+	s.armRequests()
+	active, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
+	s.Require().NoError(err)
+	s.Require().Len(active, 1)
+	firstArmedAt := *active[0].ArmedAt
+
+	s.armRequests()
+	active, err = s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
+	s.Require().NoError(err)
+	s.Require().Len(active, 1)
+	s.Equal(firstArmedAt.UTC(), active[0].ArmedAt.UTC(), "re-arming must not restamp")
 }
 
 // Concurrent duplicate deliveries are the same hazard with a tighter window.
@@ -229,6 +295,7 @@ func (s *PrewarmTestSuite) TestConcurrentDuplicateDeliveriesCreateOneRequest() {
 func (s *PrewarmTestSuite) TestConsumeForecastReducesRemaining() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
+	s.armRequests()
 
 	for i := int64(0); i < 3; i++ {
 		s.Require().NoError(s.consume(500+i, request, spotLabelKey))
@@ -255,6 +322,7 @@ func (s *PrewarmTestSuite) TestConsumeForecastReducesRemaining() {
 func (s *PrewarmTestSuite) TestConsumeForecastFloorsAtZero() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
+	s.armRequests()
 
 	for i := int64(0); i < 12; i++ {
 		s.Require().NoError(s.consume(600+i, request, spotLabelKey))
@@ -276,6 +344,7 @@ func (s *PrewarmTestSuite) TestConsumeForecastFloorsAtZero() {
 func (s *PrewarmTestSuite) TestConcurrentForecastConsumptionDoesNotLoseUpdates() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
+	s.armRequests()
 
 	for i := int64(0); i < 5; i++ {
 		s.queueJob(700 + i)
@@ -306,6 +375,7 @@ func (s *PrewarmTestSuite) TestConcurrentForecastConsumptionDoesNotLoseUpdates()
 func (s *PrewarmTestSuite) TestRedeliveredJobConsumesForecastOnce() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
+	s.armRequests()
 
 	for range 4 {
 		s.Require().NoError(s.consume(801, request, spotLabelKey))
@@ -324,6 +394,7 @@ func (s *PrewarmTestSuite) TestRedeliveredJobConsumesForecastOnce() {
 func (s *PrewarmTestSuite) TestConcurrentRedeliveriesConsumeForecastOnce() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
+	s.armRequests()
 	s.queueJob(802)
 
 	var wg sync.WaitGroup
@@ -351,6 +422,7 @@ func (s *PrewarmTestSuite) TestConcurrentRedeliveriesConsumeForecastOnce() {
 func (s *PrewarmTestSuite) TestUnknownJobConsumesNothing() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
+	s.armRequests()
 
 	s.Require().NoError(s.store.ConsumePrewarmForecast(
 		s.adminCtx, s.entity.ID, 999999, request.RunID, request.RunAttempt, spotLabelKey))
@@ -371,6 +443,7 @@ func (s *PrewarmTestSuite) TestSumRemainingPrewarmForecast() {
 
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
+	s.armRequests()
 
 	remaining, err = s.store.SumRemainingPrewarmForecast(s.adminCtx, s.entity.ID, spotLabelKey)
 	s.Require().NoError(err)
@@ -381,6 +454,7 @@ func (s *PrewarmTestSuite) TestSumRemainingPrewarmForecast() {
 	second.RunID = request.RunID + 1
 	_, _, err = s.store.CreatePrewarmRequest(s.adminCtx, second)
 	s.Require().NoError(err)
+	s.armRequests()
 
 	remaining, err = s.store.SumRemainingPrewarmForecast(s.adminCtx, s.entity.ID, spotLabelKey)
 	s.Require().NoError(err)
@@ -435,6 +509,7 @@ func (s *PrewarmTestSuite) TestForecastIsScopedToItsEntity() {
 func (s *PrewarmTestSuite) TestClaimSpeculativeInstance() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
+	s.armRequests()
 
 	expiry := time.Now().Add(8 * time.Minute)
 	s.createSpeculativeInstance("spec-1", request.ID, expiry)
@@ -462,6 +537,7 @@ func (s *PrewarmTestSuite) TestClaimSpeculativeInstance() {
 func (s *PrewarmTestSuite) TestClaimIgnoresSpeculativeRunnersTheForgeIsAlreadyUsing() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
+	s.armRequests()
 
 	expiry := time.Now().Add(8 * time.Minute)
 	taken := s.createSpeculativeInstance("spec-taken", request.ID, expiry)
@@ -494,6 +570,7 @@ func (s *PrewarmTestSuite) TestClaimIgnoresSpeculativeRunnersTheForgeIsAlreadyUs
 func (s *PrewarmTestSuite) TestClaimRejectsARunnerTheForgeTookMidClaim() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
+	s.armRequests()
 
 	expiry := time.Now().Add(8 * time.Minute)
 	instance := s.createSpeculativeInstance("spec-raced", request.ID, expiry)
@@ -552,6 +629,7 @@ func (s *PrewarmTestSuite) TestClaimIgnoresNonSpeculativeInstances() {
 func (s *PrewarmTestSuite) TestConcurrentClaimsAreDistinct() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
+	s.armRequests()
 
 	const available = 5
 	const claimers = 12
@@ -591,6 +669,7 @@ func (s *PrewarmTestSuite) TestConcurrentClaimsAreDistinct() {
 func (s *PrewarmTestSuite) TestReapableExcludesClaimedAndUnexpired() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
+	s.armRequests()
 
 	past := time.Now().Add(-time.Minute)
 	future := time.Now().Add(8 * time.Minute)
@@ -618,6 +697,7 @@ func (s *PrewarmTestSuite) TestReapableExcludesClaimedAndUnexpired() {
 func (s *PrewarmTestSuite) TestActiveRunnerIsNeverReapable() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
+	s.armRequests()
 
 	past := time.Now().Add(-time.Minute)
 	instance := s.createSpeculativeInstance("went-active", request.ID, past)
@@ -654,6 +734,7 @@ func (s *PrewarmTestSuite) TestExpirePrewarmRequests() {
 func (s *PrewarmTestSuite) TestCountSpeculativeInstances() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
+	s.armRequests()
 
 	count, err := s.store.CountSpeculativeInstances(s.adminCtx)
 	s.Require().NoError(err)
@@ -697,6 +778,7 @@ func (s *PrewarmTestSuite) TestCountPoolAvailableCapacity() {
 	// Speculative and unclaimed: available even while it boots.
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
+	s.armRequests()
 	speculative := s.createSpeculativeInstance("spec-a", request.ID, time.Now().Add(8*time.Minute))
 
 	available, err = s.store.CountPoolAvailableCapacity(s.adminCtx, s.pool.ID)
@@ -716,6 +798,7 @@ func (s *PrewarmTestSuite) TestCountPoolAvailableCapacity() {
 func (s *PrewarmTestSuite) TestPrewarmCounters() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)
+	s.armRequests()
 
 	s.Require().NoError(s.store.RecordPrewarmInstancesCreated(s.adminCtx, request.ID, spotLabelKey, 4))
 	s.Require().NoError(s.store.RecordPrewarmInstanceClaimed(s.adminCtx, request.ID, spotLabelKey))

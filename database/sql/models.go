@@ -752,6 +752,13 @@ type PrewarmRequest struct {
 	State string `gorm:"index:idx_prewarm_request_entity_state,priority:2"`
 	// ExpiresAt is when unclaimed capacity from this request may be reaped.
 	ExpiresAt time.Time `gorm:"index"`
+	// ArmedAt is when the queued-job consumer finished with the gate job that
+	// produced this forecast. Until it is set the forecast is invisible to every
+	// speculative reader, which is what keeps a forecast from consuming capacity
+	// ahead of the job it was made for. It lives in the row rather than in the
+	// pool manager's memory because the scale-set worker cannot see that memory
+	// and the pool manager's own consolidation ticker did not consult it.
+	ArmedAt *time.Time `gorm:"index"`
 
 	Targets []PrewarmRequestTarget `gorm:"foreignKey:PrewarmRequestID;constraint:OnDelete:CASCADE,OnUpdate:CASCADE;"`
 }

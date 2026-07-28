@@ -53,6 +53,10 @@ type PrewarmRequest struct {
 	CreatedAt time.Time `json:"created_at,omitempty"`
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
+	// ArmedAt is when the gate job that produced this forecast was finished
+	// with by the queued-job consumer. Nil means the forecast exists but may not
+	// be served yet; every speculative reader filters on it.
+	ArmedAt *time.Time `json:"armed_at,omitempty"`
 
 	Targets []PrewarmRequestTarget `json:"targets,omitempty"`
 }
@@ -106,7 +110,13 @@ type CreatePrewarmRequestParams struct {
 	Mode         string
 	State        PrewarmRequestState
 	ExpiresAt    time.Time
-	Targets      []CreatePrewarmTargetParams
+	// ArmedAt makes the forecast servable at creation. It is nil for a gate
+	// job's forecast, which must wait until the queued-job consumer has served
+	// that job, and set for a forecast that has nothing to wait for — a
+	// preemption replacement is for a job that was dispatched long ago, so
+	// holding it back would delay a retry rather than protect anything.
+	ArmedAt *time.Time
+	Targets []CreatePrewarmTargetParams
 }
 
 // CreatePrewarmTargetParams is one forecast target of a new request.
