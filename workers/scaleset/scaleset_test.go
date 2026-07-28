@@ -418,6 +418,72 @@ func TestReclaimedIdleRunnersDoNotHoldBackTheForecast(t *testing.T) {
 	}
 }
 
+// The hold-back is a brake on buying, not a reason to reap. When more creates
+// were interrupted than the forecast now asks for — a shrinking forecast while a
+// big cohort is still dying — subtracting them outright drives the target under
+// the runners that already exist, and the autoscaler reads that as a scale-down.
+func TestHoldBackNeverReapsRunnersTheForecastStillWants(t *testing.T) {
+	const warm, interrupted = 40, 70
+	runners := make(map[string]params.Instance, warm+interrupted)
+	for i := range warm {
+		id := fmt.Sprintf("warm-%d", i)
+		runners[id] = params.Instance{
+			ID:           id,
+			Status:       commonParams.InstanceRunning,
+			RunnerStatus: params.RunnerIdle,
+		}
+	}
+	for i := range interrupted {
+		id := fmt.Sprintf("interrupted-%d", i)
+		runners[id] = params.Instance{
+			ID:           id,
+			Status:       commonParams.InstancePendingDelete,
+			RunnerStatus: params.RunnerPending,
+		}
+	}
+	w := &Worker{
+		scaleSet:           params.ScaleSet{Enabled: true, MaxRunners: 128},
+		runners:            runners,
+		speculativeRunners: 50,
+	}
+
+	if got, want := w.runnerCount(), warm; got != want {
+		t.Fatalf("runner count = %d, want %d — the premise of this test", got, want)
+	}
+	if got, want := w.targetRunners(), warm; got != want {
+		t.Fatalf("target runners = %d, want %d", got, want)
+	}
+}
+
+// A surplus over the real target still scales down, and by the surplus alone
+// rather than the surplus plus the hold-back.
+func TestHoldBackDoesNotDeepenALegitimateScaleDown(t *testing.T) {
+	runners := map[string]params.Instance{
+		"interrupted-0": {
+			ID:           "interrupted-0",
+			Status:       commonParams.InstancePendingDelete,
+			RunnerStatus: params.RunnerPending,
+		},
+	}
+	for i := range 20 {
+		id := fmt.Sprintf("warm-%d", i)
+		runners[id] = params.Instance{
+			ID:           id,
+			Status:       commonParams.InstanceRunning,
+			RunnerStatus: params.RunnerIdle,
+		}
+	}
+	w := &Worker{
+		scaleSet:           params.ScaleSet{Enabled: true, MaxRunners: 128, MinIdleRunners: 10},
+		runners:            runners,
+		speculativeRunners: 3,
+	}
+
+	if got, want := w.targetRunners(), 13; got != want {
+		t.Fatalf("target runners = %d, want %d", got, want)
+	}
+}
+
 func TestScaleSetUpdateWakesAutoscaler(t *testing.T) {
 	w := &Worker{
 		ctx:           context.Background(),

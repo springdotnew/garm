@@ -1224,14 +1224,24 @@ func (w *Worker) targetRunners() int {
 	if w.speculativeRunners > 0 {
 		speculativeRunners = uint(w.speculativeRunners)
 	}
+	targetRunners := min(w.scaleSet.MinIdleRunners+desiredRunners+speculativeRunners, w.scaleSet.MaxRunners)
+
 	// A machine that is being torn down but has not gone yet is already paid
 	// for, so the forecast must not ask for it twice. Only the speculative part
 	// of the target is held back: assigned jobs are real work and a runner that
 	// dies under one still needs replacing immediately.
-	speculativeRunners -= min(speculativeRunners, uint(w.unregisteredRunnersBeingTornDown()))
-	targetRunners := min(w.scaleSet.MinIdleRunners+desiredRunners+speculativeRunners, w.scaleSet.MaxRunners)
+	heldBack := min(speculativeRunners, uint(w.unregisteredRunnersBeingTornDown()))
+	if heldBack == 0 {
+		return int(targetRunners)
+	}
+	// The hold-back is a brake on buying, and only that. Letting it push the
+	// target below the runners that already exist would turn it into a
+	// scale-down and reap warm runners the forecast still wants — which is the
+	// exact opposite of the point, and reachable whenever more creates were
+	// interrupted than the current forecast asks for.
+	existingRunners := min(uint(w.runnerCount()), targetRunners)
 
-	return int(targetRunners)
+	return int(max(targetRunners-min(targetRunners, heldBack), existingRunners))
 }
 
 // unregisteredRunnersBeingTornDown counts this scale set's runners whose row has
