@@ -341,8 +341,19 @@ func (s *sqlDatabase) claimOneSpeculativeInstance(poolIDs []uuid.UUID, workflowJ
 
 		// The predicate is repeated in the UPDATE so the write itself is the
 		// arbiter. Whoever flips the column from NULL wins the runner.
+		//
+		// All of it has to be repeated, not just the reservation column. The
+		// forge can hand this runner a job of its own between the SELECT above
+		// and this write, which moves runner_status to active without touching
+		// reserved_for_workflow_job_id — and a claim that only checks the
+		// reservation would take it anyway and report the queued job as served
+		// by a runner that is already busy. That is a job stranded until the
+		// ten-minute unlock, which is how it was found: twice on the binary
+		// that was supposed to have fixed it.
 		update := tx.Model(&Instance{}).
-			Where("id = ? AND reserved_for_workflow_job_id IS NULL", candidate.ID).
+			Where(
+				"id = ? AND reserved_for_workflow_job_id IS NULL AND status IN ? AND runner_status IN ?",
+				candidate.ID, speculativeClaimableStatuses, speculativeClaimableRunnerStatuses).
 			UpdateColumn("reserved_for_workflow_job_id", workflowJobID)
 		if update.Error != nil {
 			return fmt.Errorf("error claiming speculative instance: %w", update.Error)
