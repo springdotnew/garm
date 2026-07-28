@@ -196,6 +196,7 @@ func NewEntityPoolManager(ctx context.Context, entity params.ForgeEntity, instan
 		prewarmTrigger:          make(chan struct{}, 1),
 
 		publishedPrewarmTargets: make(map[prewarmSeries]uint64),
+		pendingPrewarmWakes:     make(map[int64]struct{}),
 	}
 	return repo, nil
 }
@@ -233,6 +234,18 @@ type basePoolManager struct {
 	// all — and by then the gauge has lost its subject, not just its value.
 	publishedPrewarmTargets map[prewarmSeries]uint64
 	prewarmPass             uint64
+
+	// pendingPrewarmWakes holds the trigger job of every forecast that has been
+	// recorded but not yet acted on, so speculation can be woken *after* the job
+	// that produced it has been served rather than a second before it.
+	//
+	// Waking inline used to be the whole mechanism, and it inverted the order it
+	// claimed to keep: the real path is woken through the job backoff, which is
+	// a second on our controllers, while this one fired immediately. Anything
+	// timing-based fixes that only for the backoff it was tuned against, so the
+	// wake now waits on the job itself.
+	pendingPrewarmWakes    map[int64]struct{}
+	pendingPrewarmWakesMux sync.Mutex
 
 	pendingInstancesTrigger  chan struct{}
 	queuedJobsTrigger        chan struct{}
@@ -568,8 +581,11 @@ func (r *basePoolManager) HandleWorkflowJob(job params.WorkflowJob) error {
 
 	switch job.Action {
 	case "queued":
-		// Wake the real queued-job consumer first. A forecast must never be
-		// serviced ahead of the job that produced it.
+		// Wake the real queued-job consumer. A forecast must never be serviced
+		// ahead of the job that produced it, and ordering the two calls here is
+		// not enough to ensure that: this wake goes through the job backoff,
+		// while speculation used to be woken inline. So the forecast only arms a
+		// wake, which the consumer releases once it has dealt with this job.
 		r.triggerQueuedJobsAfterBackoff()
 		r.handlePrewarmForQueuedJob(ctx, jobParams)
 	case "in_progress":
@@ -2370,6 +2386,12 @@ func (r *basePoolManager) consumeQueuedJobsWithLimiter(reservationLimiter *poolR
 	controllerInfo := r.controllerInfoSnapshot()
 	jobBackoff := controllerInfo.JobBackoff()
 
+	// Jobs this pass sees but deliberately leaves for the next one. A forecast
+	// whose trigger job is in here has not been served yet, so its speculation
+	// stays parked; see releasePrewarmWakesExcept.
+	backedOffJobs := make(map[int64]struct{})
+	defer func() { r.releasePrewarmWakesExcept(backedOffJobs) }()
+
 	poolsCache := poolsForTags{
 		poolCacheType: r.entity.GetPoolBalancerType(),
 	}
@@ -2391,6 +2413,7 @@ func (r *basePoolManager) consumeQueuedJobsWithLimiter(reservationLimiter *poolR
 
 		if time.Since(job.UpdatedAt) < jobBackoff {
 			// give the idle runners a chance to pick up the job.
+			backedOffJobs[job.WorkflowJobID] = struct{}{}
 			slog.DebugContext(
 				r.ctx, "job backoff not reached", "backoff_interval", controllerInfo.MinimumJobAgeBackoff,
 				"job_id", job.WorkflowJobID)
