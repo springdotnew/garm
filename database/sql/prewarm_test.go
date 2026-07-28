@@ -795,6 +795,75 @@ func (s *PrewarmTestSuite) TestCountPoolAvailableCapacity() {
 	s.Require().Equal(int64(1), available)
 }
 
+// A speculative runner whose create was interrupted still has a machine behind
+// it until the delete lands. It has to keep counting as capacity for that long,
+// or a controller that comes back up mid-cohort buys a second machine for every
+// slot it already paid for. Measured on the bench rig before this held: 212 VMs
+// created for a 110-runner forecast, peaking at 155 alive for 111 slots.
+func (s *PrewarmTestSuite) TestUnreclaimedSpeculativeRunnersStillCountAsCapacity() {
+	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
+	s.Require().NoError(err)
+	s.armRequests()
+
+	interrupted := s.createSpeculativeInstance("killed-mid-create", request.ID, time.Now().Add(8*time.Minute))
+
+	available, err := s.store.CountPoolAvailableCapacity(s.adminCtx, s.pool.ID)
+	s.Require().NoError(err)
+	s.Require().Equal(int64(1), available)
+
+	// Every state the teardown walks through, in the order the state machine
+	// allows: the machine exists throughout, so the count must not move.
+	for _, status := range []commonParams.InstanceStatus{
+		commonParams.InstancePendingDelete,
+		commonParams.InstanceDeleting,
+		commonParams.InstanceError,
+	} {
+		s.setInstanceStatus(interrupted.Name, status)
+
+		available, err = s.store.CountPoolAvailableCapacity(s.adminCtx, s.pool.ID)
+		s.Require().NoError(err)
+		s.Require().Equal(int64(1), available,
+			"a speculative runner in %q still has a provider machine behind it", status)
+	}
+
+	// Once the machine is actually gone the slot is genuinely empty again, and
+	// the next reconcile pass is supposed to see the deficit and buy.
+	s.setInstanceStatus(interrupted.Name, commonParams.InstanceDeleting)
+	s.setInstanceStatus(interrupted.Name, commonParams.InstanceDeleted)
+
+	available, err = s.store.CountPoolAvailableCapacity(s.adminCtx, s.pool.ID)
+	s.Require().NoError(err)
+	s.Require().Zero(available)
+}
+
+// setInstanceStatus moves an instance one legal step along the status state
+// machine, so a test that wants a torn-down runner gets there the way the
+// provider worker does rather than by writing the column directly.
+func (s *PrewarmTestSuite) setInstanceStatus(name string, status commonParams.InstanceStatus) {
+	s.T().Helper()
+	_, err := s.store.UpdateInstance(s.adminCtx, name, params.UpdateInstanceParams{Status: status})
+	s.Require().NoError(err)
+}
+
+// The machine behind an interrupted create belongs to whoever claimed it. If a
+// job already claimed the runner, its slot is not the forecast's to hold open.
+func (s *PrewarmTestSuite) TestClaimedSpeculativeRunnersDoNotCountWhileBeingTornDown() {
+	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
+	s.Require().NoError(err)
+	s.armRequests()
+
+	claimed := s.createSpeculativeInstance("claimed-then-killed", request.ID, time.Now().Add(8*time.Minute))
+	_, err = s.store.ClaimSpeculativeInstance(s.adminCtx, []string{s.pool.ID}, 4242)
+	s.Require().NoError(err)
+
+	s.setInstanceStatus(claimed.Name, commonParams.InstancePendingDelete)
+	s.setInstanceStatus(claimed.Name, commonParams.InstanceDeleting)
+
+	available, err := s.store.CountPoolAvailableCapacity(s.adminCtx, s.pool.ID)
+	s.Require().NoError(err)
+	s.Require().Zero(available)
+}
+
 func (s *PrewarmTestSuite) TestPrewarmCounters() {
 	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
 	s.Require().NoError(err)

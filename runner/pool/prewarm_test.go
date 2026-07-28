@@ -1043,6 +1043,39 @@ func (s *PrewarmPoolTestSuite) TestRestartMidCohortResumesWithoutDuplicating() {
 	s.Len(s.speculativeInstances(), prewarmTestCohortLen)
 }
 
+// The restart above interrupts the cohort politely: every runner it did create
+// is healthy on the way back up, so of course it counts. A real restart is not
+// polite. It kills the creates that were in flight, and those rows come back as
+// errors with a provider machine still running behind each one. That is the case
+// that doubled the bill on the bench rig — 212 machines for a 110-runner
+// forecast — because a row nobody can claim looked like a slot nobody had paid
+// for.
+func (s *PrewarmPoolTestSuite) TestRestartMidCohortDoesNotReplaceMachinesStillBeingTornDown() {
+	const interrupted = prewarmTestCohortLen / 2
+	s.mgr.prewarmCfg.MaxSpeculativeRunners = interrupted
+
+	s.recordGateJob(1, 100)
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+
+	// A restart does not leave the interrupted creates alone: the provider
+	// worker picks them up and starts tearing them down, which is what takes
+	// them out of the claimable states while their machines are still up.
+	killed := s.speculativeInstances()
+	s.Require().Len(killed, interrupted)
+	for _, instance := range killed {
+		_, err := s.store.UpdateInstance(s.adminCtx, instance.Name, params.UpdateInstanceParams{
+			Status: commonParams.InstancePendingDelete,
+		})
+		s.Require().NoError(err)
+	}
+
+	resumed := s.newPoolManager()
+	s.Require().NoError(resumed.reconcilePrewarm())
+
+	s.Len(s.speculativeInstances(), prewarmTestCohortLen,
+		"the resumed controller bought a second machine for slots whose first machine is still up")
+}
+
 func (s *PrewarmPoolTestSuite) TestOverlappingRunsShareCapacity() {
 	s.recordGateJob(1, 100)
 	s.recordGateJob(2, 200)
