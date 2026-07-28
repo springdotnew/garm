@@ -24,6 +24,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/suite"
+	"gorm.io/gorm"
 
 	runnerErrors "github.com/cloudbase/garm-provider-common/errors"
 	commonParams "github.com/cloudbase/garm-provider-common/params"
@@ -478,6 +479,57 @@ func (s *PrewarmTestSuite) TestClaimIgnoresSpeculativeRunnersTheForgeIsAlreadyUs
 	capacity, err := s.store.CountPoolAvailableCapacity(s.adminCtx, s.pool.ID)
 	s.Require().NoError(err)
 	s.Require().Equal(int64(0), capacity)
+}
+
+// The previous test proves a runner the forge is *already* using is filtered
+// out by the SELECT. This one covers the window the SELECT cannot see: the forge
+// can hand the candidate a job between the read and the write, and a claim whose
+// UPDATE re-asserts only the reservation column takes it anyway. The queued job
+// is then reported as served by a runner that is busy, and waits out the
+// ten-minute unlock — 661 seconds, in the run that first surfaced it.
+//
+// The forge's write is simulated by a one-shot callback that fires after the
+// candidate SELECT, inside the claim's own transaction, which is precisely where
+// the real race lands.
+func (s *PrewarmTestSuite) TestClaimRejectsARunnerTheForgeTookMidClaim() {
+	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
+	s.Require().NoError(err)
+
+	expiry := time.Now().Add(8 * time.Minute)
+	instance := s.createSpeculativeInstance("spec-raced", request.ID, expiry)
+
+	store, ok := s.store.(*sqlDatabase)
+	s.Require().True(ok, "the race can only be staged against the sql store")
+
+	const hookName = "test:forge_takes_candidate_mid_claim"
+	taken := false
+	s.Require().NoError(store.conn.Callback().Query().After("gorm:query").Register(
+		hookName,
+		func(tx *gorm.DB) {
+			if taken {
+				return
+			}
+			if _, isInstance := tx.Statement.Dest.(*Instance); !isInstance {
+				return
+			}
+			taken = true
+			tx.Session(&gorm.Session{NewDB: true}).Model(&Instance{}).
+				Where("id = ?", instance.ID).
+				UpdateColumn("runner_status", params.RunnerActive)
+		}))
+	defer func() {
+		s.Require().NoError(store.conn.Callback().Query().Remove(hookName))
+	}()
+
+	_, err = s.store.ClaimSpeculativeInstance(s.adminCtx, []string{s.pool.ID}, 111)
+	s.Require().True(taken, "the race was never staged; the test proves nothing")
+	s.Require().True(errors.Is(err, runnerErrors.ErrNotFound),
+		"a runner the forge took mid-claim must not be handed to a queued job")
+
+	// And it must not be left reserved to a job it never served.
+	after, err := s.store.GetInstance(s.adminCtx, instance.Name)
+	s.Require().NoError(err)
+	s.Require().Zero(after.ReservedForWorkflowJobID)
 }
 
 func (s *PrewarmTestSuite) TestClaimIgnoresNonSpeculativeInstances() {
