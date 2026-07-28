@@ -332,6 +332,63 @@ func TestLateFailedCreationImmediatelyOpensReplacement(t *testing.T) {
 	}
 }
 
+// A restart marks every interrupted create `pending_delete` before the machine
+// behind it is gone, and runnerCount() rightly refuses to count a runner that
+// cannot serve a job. Sizing the forecast off that alone orders the whole cohort
+// again on top of the one still running: measured on the bench rig at
+// current_runners=0 with ten machines up, nine seconds after the restart.
+func TestRestartDoesNotReorderSpeculativeRunnersStillBeingTornDown(t *testing.T) {
+	const cohort = 10
+	runners := make(map[string]params.Instance, cohort)
+	for i := range cohort {
+		id := fmt.Sprintf("speculative-%d", i)
+		runners[id] = params.Instance{
+			ID:           id,
+			Status:       commonParams.InstancePendingDelete,
+			RunnerStatus: params.RunnerPending,
+			Speculative:  true,
+		}
+	}
+	w := &Worker{
+		scaleSet:           params.ScaleSet{Enabled: true, MaxRunners: 64},
+		runners:            runners,
+		speculativeRunners: cohort,
+	}
+
+	if got, want := w.runnerCount(), 0; got != want {
+		t.Fatalf("runner count = %d, want %d — the premise of this test", got, want)
+	}
+	if got, want := w.targetRunners(), 0; got != want {
+		t.Fatalf("target runners = %d, want %d", got, want)
+	}
+	if got, want := runnerCreationsToStart(w.targetRunners(), w.runnerCount(), w.creationsInFlight), 0; got != want {
+		t.Fatalf("creations = %d, want %d", got, want)
+	}
+}
+
+// Real demand is not held back. A runner assigned to a queued job that dies
+// mid-teardown still needs replacing right away, so only the speculative part of
+// the target is suppressed.
+func TestTornDownSpeculativeRunnersDoNotHoldBackAssignedWork(t *testing.T) {
+	runners := map[string]params.Instance{
+		"speculative-0": {
+			ID:           "speculative-0",
+			Status:       commonParams.InstancePendingDelete,
+			RunnerStatus: params.RunnerPending,
+			Speculative:  true,
+		},
+	}
+	w := &Worker{
+		scaleSet:           params.ScaleSet{Enabled: true, MaxRunners: 64, DesiredRunnerCount: 4},
+		runners:            runners,
+		speculativeRunners: 1,
+	}
+
+	if got, want := w.targetRunners(), 4; got != want {
+		t.Fatalf("target runners = %d, want %d", got, want)
+	}
+}
+
 func TestScaleSetUpdateWakesAutoscaler(t *testing.T) {
 	w := &Worker{
 		ctx:           context.Background(),

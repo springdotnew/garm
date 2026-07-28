@@ -1224,9 +1224,32 @@ func (w *Worker) targetRunners() int {
 	if w.speculativeRunners > 0 {
 		speculativeRunners = uint(w.speculativeRunners)
 	}
+	// Speculative runners whose machine has not been reclaimed yet are already
+	// paid for, so the forecast must not ask for them twice. Only the
+	// speculative part of the target is held back: assigned jobs are real work
+	// and a runner that dies under one still needs replacing immediately.
+	speculativeRunners -= min(speculativeRunners, uint(w.speculativeRunnersBeingTornDown()))
 	targetRunners := min(w.scaleSet.MinIdleRunners+desiredRunners+speculativeRunners, w.scaleSet.MaxRunners)
 
 	return int(targetRunners)
+}
+
+// speculativeRunnersBeingTornDown counts this scale set's unclaimed speculative
+// runners whose row has left the states runnerCount() accepts but whose machine
+// may well still be running. A restart puts every interrupted create in exactly
+// that position at once, so without this the worker reads a full cohort as zero
+// and orders the whole cohort again while the first one is still up.
+func (w *Worker) speculativeRunnersBeingTornDown() int {
+	count := 0
+	for _, runner := range w.runners {
+		if !runner.Speculative || runner.ReservedForWorkflowJobID != nil {
+			continue
+		}
+		if garmErrors.InstanceIsBeingDeleted(runner.Status) {
+			count++
+		}
+	}
+	return count
 }
 
 func (w *Worker) runnerCount() int {
