@@ -208,15 +208,28 @@ func (r *basePoolManager) releasePrewarmWakesExcept(stillWaiting map[int64]struc
 	}
 
 	armedAt := time.Now()
+	failed := make([]int64, 0, len(released))
 	for _, jobID := range released {
 		if err := r.store.ArmPrewarmRequests(r.ctx, r.entity.ID, jobID, armedAt); err != nil {
-			// Leaving it unarmed is the safe failure: the forecast simply is not
-			// served. Waking the reconciler anyway would be pointless, but it is
-			// also harmless, and the next pass retries the arming.
+			// Leaving it unarmed is the safe direction — the forecast is simply
+			// not served — but leaving it *forgotten* is not, because nothing
+			// would ever arm it and the fanout would run cold for no reason a
+			// reader of the logs could act on. Put it back so the next pass
+			// tries again; ArmPrewarmRequests only touches rows that are still
+			// NULL, so a retry cannot re-arm what already succeeded.
 			slog.With(slog.Any("error", err)).ErrorContext(
 				r.ctx, "failed to arm prewarm requests",
 				"trigger_job_id", jobID)
+			failed = append(failed, jobID)
 		}
+	}
+
+	if len(failed) > 0 {
+		r.pendingPrewarmWakesMux.Lock()
+		for _, jobID := range failed {
+			r.pendingPrewarmWakes[jobID] = struct{}{}
+		}
+		r.pendingPrewarmWakesMux.Unlock()
 	}
 
 	r.triggerPrewarmReconcile()
