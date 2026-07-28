@@ -1224,30 +1224,43 @@ func (w *Worker) targetRunners() int {
 	if w.speculativeRunners > 0 {
 		speculativeRunners = uint(w.speculativeRunners)
 	}
-	// Speculative runners whose machine has not been reclaimed yet are already
-	// paid for, so the forecast must not ask for them twice. Only the
-	// speculative part of the target is held back: assigned jobs are real work
-	// and a runner that dies under one still needs replacing immediately.
-	speculativeRunners -= min(speculativeRunners, uint(w.speculativeRunnersBeingTornDown()))
+	// A machine that is being torn down but has not gone yet is already paid
+	// for, so the forecast must not ask for it twice. Only the speculative part
+	// of the target is held back: assigned jobs are real work and a runner that
+	// dies under one still needs replacing immediately.
+	speculativeRunners -= min(speculativeRunners, uint(w.unregisteredRunnersBeingTornDown()))
 	targetRunners := min(w.scaleSet.MinIdleRunners+desiredRunners+speculativeRunners, w.scaleSet.MaxRunners)
 
 	return int(targetRunners)
 }
 
-// speculativeRunnersBeingTornDown counts this scale set's unclaimed speculative
-// runners whose row has left the states runnerCount() accepts but whose machine
-// may well still be running. A restart puts every interrupted create in exactly
-// that position at once, so without this the worker reads a full cohort as zero
-// and orders the whole cohort again while the first one is still up.
-func (w *Worker) speculativeRunnersBeingTornDown() int {
+// unregisteredRunnersBeingTornDown counts this scale set's runners whose row has
+// left the states runnerCount() accepts before the runner ever registered with
+// GitHub — an interrupted create. The row will never serve a job, but the
+// machine it asked the provider for is very often still running, and it stays
+// that way until the delete lands. Start() forces every instance it finds in
+// creating to pending_delete, so a restart mid-cohort produces a whole cohort of
+// these at once; without this the worker reads that cohort as zero runners and
+// orders all of it again while the first one is still up.
+//
+// Runners that did register are deliberately excluded. An idle runner being
+// scaled down, or one that has just finished a job, is a machine that has
+// already done its work; suppressing the forecast every time one of those is
+// reclaimed would starve the next fanout during ordinary churn.
+//
+// Note this deliberately does not key off Instance.Speculative: scale sets track
+// their forecast as a count on the worker, not a flag on the row, so nothing in
+// this package ever sets it. Keying off it would make this dead code.
+func (w *Worker) unregisteredRunnersBeingTornDown() int {
 	count := 0
 	for _, runner := range w.runners {
-		if !runner.Speculative || runner.ReservedForWorkflowJobID != nil {
+		if !garmErrors.InstanceIsBeingDeleted(runner.Status) {
 			continue
 		}
-		if garmErrors.InstanceIsBeingDeleted(runner.Status) {
-			count++
+		if runner.RunnerStatus != params.RunnerPending && runner.RunnerStatus != params.RunnerInstalling {
+			continue
 		}
+		count++
 	}
 	return count
 }
