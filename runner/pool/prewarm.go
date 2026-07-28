@@ -155,9 +155,48 @@ func (r *basePoolManager) createPrewarmRequest(ctx context.Context, job params.J
 		"forecast", formatForecast(targets))
 
 	if created {
-		r.triggerPrewarmReconcile()
+		r.deferPrewarmReconcile(job.WorkflowJobID)
 	}
 	return nil
+}
+
+// deferPrewarmReconcile arms a wake that the queued-job consumer releases once
+// it has dealt with the trigger job.
+//
+// Nothing is lost if the release never comes: the reconcile loop runs on the
+// consolidation interval regardless, so the worst case is that a forecast is
+// serviced on the next tick instead of immediately. That is the right way round
+// — late speculation costs a few seconds of head start, early speculation
+// competes with the job that asked for it.
+func (r *basePoolManager) deferPrewarmReconcile(triggerJobID int64) {
+	r.pendingPrewarmWakesMux.Lock()
+	r.pendingPrewarmWakes[triggerJobID] = struct{}{}
+	r.pendingPrewarmWakesMux.Unlock()
+}
+
+// releasePrewarmWakesExcept wakes speculation for every forecast whose trigger
+// job the caller has finished with, and leaves the rest armed.
+//
+// `stillWaiting` is the set of jobs the pass saw but deliberately did not serve
+// yet — today that is the job backoff, which is exactly the window this whole
+// mechanism exists to sit behind. A trigger job that is absent from the queue
+// entirely is released rather than kept: its run may have been cancelled, and a
+// forecast pinned to a job that is never coming back would be pinned forever.
+func (r *basePoolManager) releasePrewarmWakesExcept(stillWaiting map[int64]struct{}) {
+	r.pendingPrewarmWakesMux.Lock()
+	released := false
+	for jobID := range r.pendingPrewarmWakes {
+		if _, waiting := stillWaiting[jobID]; waiting {
+			continue
+		}
+		delete(r.pendingPrewarmWakes, jobID)
+		released = true
+	}
+	r.pendingPrewarmWakesMux.Unlock()
+
+	if released {
+		r.triggerPrewarmReconcile()
+	}
 }
 
 // formatForecast renders a rule's targets as "label=count" pairs, in the order

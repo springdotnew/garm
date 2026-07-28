@@ -158,6 +158,7 @@ func (s *PrewarmPoolTestSuite) newPoolManager() *basePoolManager {
 		prewarmTrigger:          make(chan struct{}, 1),
 		prewarmCfg:              s.prewarmConfig(config.PrewarmModeActive),
 		publishedPrewarmTargets: make(map[prewarmSeries]uint64),
+		pendingPrewarmWakes:     make(map[int64]struct{}),
 	}
 }
 
@@ -271,6 +272,18 @@ func instanceNames(instances []params.Instance) []string {
 	return names
 }
 
+// pendingPrewarmWakes reports the forecasts still waiting on their trigger job.
+func (s *PrewarmPoolTestSuite) pendingPrewarmWakes() map[int64]struct{} {
+	s.mgr.pendingPrewarmWakesMux.Lock()
+	defer s.mgr.pendingPrewarmWakesMux.Unlock()
+
+	pending := make(map[int64]struct{}, len(s.mgr.pendingPrewarmWakes))
+	for jobID := range s.mgr.pendingPrewarmWakes {
+		pending[jobID] = struct{}{}
+	}
+	return pending
+}
+
 // syncJobsFromDB mirrors what the watcher does for the queued-job consumer.
 func (s *PrewarmPoolTestSuite) syncJobsFromDB() {
 	allJobs, err := s.store.ListAllJobs(s.adminCtx)
@@ -316,6 +329,62 @@ func (s *PrewarmPoolTestSuite) TestGateJobIsServedBeforeSpeculation() {
 	s.Require().NoError(s.mgr.reconcilePrewarm())
 	s.Len(s.speculativeInstances(), prewarmTestCohortLen)
 	s.Len(s.allInstances(), prewarmTestCohortLen+1)
+}
+
+// The previous test hand-sequences the two halves, so it proves the *outcome*
+// is right when the consumer happens to run first — not that the runtime makes
+// it run first. It did not: the real path is woken through the job backoff
+// (a second on our controllers) while speculation was woken inline, so on a live
+// controller the first speculative provider call beat the gate job's
+// reservation by ~800ms. This pins the ordering itself.
+func (s *PrewarmPoolTestSuite) TestSpeculationWaitsForTheGateJobsPass() {
+	s.mgr.mux.Lock()
+	s.mgr.controllerInfo.MinimumJobAgeBackoff = 3600
+	s.mgr.mux.Unlock()
+
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+
+	s.Empty(s.mgr.prewarmTrigger, "recording a forecast must not wake speculation by itself")
+	s.Len(s.pendingPrewarmWakes(), 1, "the forecast should be waiting on its gate job")
+
+	// A pass that sees the gate job but leaves it inside its backoff has not
+	// served it, so the wake stays armed.
+	s.syncJobsFromDB()
+	s.Require().NoError(s.mgr.consumeQueuedJobs())
+	s.Empty(s.mgr.prewarmTrigger, "speculation must not be woken while the gate job is still backed off")
+	s.Len(s.pendingPrewarmWakes(), 1)
+
+	// The pass that reaches the job releases it.
+	s.mgr.mux.Lock()
+	s.mgr.controllerInfo.MinimumJobAgeBackoff = 0
+	s.mgr.mux.Unlock()
+
+	s.Require().NoError(s.mgr.consumeQueuedJobs())
+	s.Len(s.mgr.prewarmTrigger, 1, "serving the gate job must wake speculation")
+	s.Empty(s.pendingPrewarmWakes())
+
+	instances := s.allInstances()
+	s.Require().Len(instances, 1, "gate job should be served by exactly one runner")
+	s.False(instances[0].Speculative, "gate job must not consume its own forecast")
+}
+
+// A forecast whose trigger job never comes back — a cancelled run, a job that
+// completed while the webhook was in flight — must not pin speculation forever.
+func (s *PrewarmPoolTestSuite) TestForecastIsReleasedWhenTheGateJobVanishes() {
+	s.Require().NoError(s.mgr.HandleWorkflowJob(s.gateJob(1, 100)))
+	s.Require().Len(s.pendingPrewarmWakes(), 1)
+
+	// The consumer sees an empty queue: whatever happened to the job, it is not
+	// waiting on this pass.
+	s.mgr.mux.Lock()
+	for k := range s.mgr.jobs {
+		delete(s.mgr.jobs, k)
+	}
+	s.mgr.mux.Unlock()
+
+	s.Require().NoError(s.mgr.consumeQueuedJobs())
+	s.Empty(s.pendingPrewarmWakes(), "a forecast must not stay pinned to a job that is gone")
+	s.Len(s.mgr.prewarmTrigger, 1)
 }
 
 func (s *PrewarmPoolTestSuite) TestDuplicateWebhookDeliveriesCreateOneCohort() {
