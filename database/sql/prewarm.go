@@ -254,6 +254,12 @@ func (s *sqlDatabase) SumRemainingPrewarmForecast(_ context.Context, entityID, l
 		ids = append(ids, request.ID)
 	}
 
+	// Deliberately the prediction alone, not the pool manager's UnspentBudget.
+	// Only the pool path records created counts, so subtracting them here would
+	// be a no-op for a scale-set entity and, on an entity that runs both against
+	// one label, would collapse the scale set's autoscale target the moment a
+	// pool bought the cohort.
+	//
 	// Rows where demand has caught up with the target are filtered out rather
 	// than clamped, which keeps the sum non-negative without a per-row MAX()
 	// that sqlite and postgres spell differently.

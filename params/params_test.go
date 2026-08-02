@@ -224,3 +224,67 @@ func TestUpdateControllerParamsValidateAgentVersion(t *testing.T) {
 		t.Errorf("expected %q to be rejected", version)
 	}
 }
+
+// The forecast and the budget answer two different questions, and the reconciler
+// needs both: how much work is still predicted, and how much of it has not
+// already been paid for. Conflating them is what let one request buy its
+// forecast several times over.
+func TestForecastAndBudgetAnswerDifferentQuestions(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		target            PrewarmRequestTarget
+		expectedRemaining uint
+		expectedUnspent   uint
+	}{
+		{
+			name:              "untouched",
+			target:            PrewarmRequestTarget{TargetCount: 10},
+			expectedRemaining: 10,
+			expectedUnspent:   10,
+		},
+		{
+			// Real demand retires the prediction, but buying nothing leaves the
+			// budget intact — the ordinary queued-job path owns those jobs now.
+			name:              "real demand arrived",
+			target:            PrewarmRequestTarget{TargetCount: 10, ObservedDemand: 4},
+			expectedRemaining: 6,
+			expectedUnspent:   10,
+		},
+		{
+			// The regression. The prediction is untouched because none of the
+			// predicted jobs have shown up, but the budget is gone: this request
+			// has already bought all ten. Before this it would buy them again
+			// every time anything else drained the pool.
+			name:              "fully bought, nothing arrived",
+			target:            PrewarmRequestTarget{TargetCount: 10, CreatedCount: 10},
+			expectedRemaining: 10,
+			expectedUnspent:   0,
+		},
+		{
+			// A cohort the global ceiling truncated: still predicted, still
+			// affordable, so a later pass can finish it.
+			name:              "partially bought",
+			target:            PrewarmRequestTarget{TargetCount: 10, CreatedCount: 4},
+			expectedRemaining: 10,
+			expectedUnspent:   6,
+		},
+		{
+			name:              "both counters moved",
+			target:            PrewarmRequestTarget{TargetCount: 10, ObservedDemand: 3, CreatedCount: 7},
+			expectedRemaining: 7,
+			expectedUnspent:   3,
+		},
+		{
+			// Neither may wrap around into an enormous unsigned number.
+			name:              "overshoot clamps to zero",
+			target:            PrewarmRequestTarget{TargetCount: 10, ObservedDemand: 12, CreatedCount: 22},
+			expectedRemaining: 0,
+			expectedUnspent:   0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.expectedRemaining, tc.target.RemainingForecast(), "remaining forecast")
+			require.Equal(t, tc.expectedUnspent, tc.target.UnspentBudget(), "unspent budget")
+		})
+	}
+}
