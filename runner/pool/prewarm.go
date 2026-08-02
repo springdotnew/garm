@@ -485,6 +485,7 @@ func aggregatePrewarmDemandInState(
 				order = append(order, target.LabelKey)
 			}
 			existing.Remaining += remaining
+			existing.Unspent += target.UnspentBudget()
 			existing.RequestIDs = append(existing.RequestIDs, request.ID)
 			if request.ExpiresAt.After(existing.ExpiresAt) {
 				existing.ExpiresAt = request.ExpiresAt
@@ -530,6 +531,32 @@ func (r *basePoolManager) planPrewarmTarget(demand params.PrewarmDemand, claimed
 			"pool_id", pool.ID,
 			"remaining_forecast", demand.Remaining,
 			"available", available)
+		return prewarmPlan{}, nil
+	}
+
+	// Never buy more than the forecast, however the pool got drained.
+	//
+	// `available` is pool-wide while the forecast is per-request, so a run whose
+	// own predicted jobs never arrived will keep seeing a deficit every time
+	// anything else consumes the pool — another pull request's jobs claiming
+	// these very runners, most of all. It then re-buys its whole forecast, again,
+	// for as long as its window is open. In production on 2026-08-02 a 10-runner
+	// `gcp-8vcpu` target created 22 that way, still buying three minutes after
+	// its own run had finished.
+	//
+	// The budget is what a request has not already paid for, so a cohort the
+	// global ceiling truncated still finishes later — the part already alive is
+	// subtracted through `available`, not through the budget.
+	if unspent := int64(demand.Unspent); deficit > unspent {
+		slog.DebugContext(
+			r.ctx, "prewarm deficit capped by the remaining forecast budget",
+			"label_key", demand.LabelKey,
+			"pool_id", pool.ID,
+			"deficit", deficit,
+			"unspent_budget", unspent)
+		deficit = unspent
+	}
+	if deficit <= 0 {
 		return prewarmPlan{}, nil
 	}
 

@@ -1084,6 +1084,48 @@ func (s *PrewarmPoolTestSuite) TestOverlappingRunsShareCapacity() {
 	s.Len(s.speculativeInstances(), 2*prewarmTestCohortLen)
 }
 
+// A forecast is a budget spent once, not a level held up for the length of its
+// window.
+//
+// The two things reconcile subtracts do not have the same scope: capacity is
+// counted pool-wide, but a forecast is consumed per run. So when another run's
+// jobs take the runners this one bought, the deficit reopens against a
+// prediction this run's own demand never touched, and it buys the cohort again —
+// and again, for as long as the window is open. With several pull requests in
+// flight the requests refill each other's consumption and the fleet grows
+// without any single one exceeding its forecast on paper. Production,
+// 2026-08-02: a 10-runner `gcp-8vcpu` target created 22, still buying three
+// minutes after its own run had finished.
+func (s *PrewarmPoolTestSuite) TestAnotherRunsDemandDoesNotReopenABoughtForecast() {
+	s.recordGateJob(1, 100)
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+	s.Require().Len(s.speculativeInstances(), prewarmTestCohortLen)
+
+	// A run with no forecast of its own: its jobs take the capacity without
+	// consuming the prediction, which is exactly the asymmetry at fault.
+	for jobID := range int64(prewarmTestCohortLen) {
+		s.Require().NoError(s.mgr.HandleWorkflowJob(
+			s.workflowJob(jobID+10, 900, "build", prewarmTestWorkflow)))
+	}
+	s.syncJobsFromDB()
+	s.Require().NoError(s.mgr.consumeQueuedJobs())
+
+	requests, err := s.store.ListActivePrewarmRequests(s.adminCtx, s.entity.ID)
+	s.Require().NoError(err)
+	s.Require().Len(requests, 1)
+	s.Require().Len(requests[0].Targets, 1)
+	target := requests[0].Targets[0]
+	s.Require().EqualValues(0, target.ObservedDemand,
+		"another run's jobs must not consume this run's forecast")
+	s.Require().EqualValues(prewarmTestCohortLen, target.CreatedCount,
+		"the whole forecast has already been bought")
+
+	s.Require().NoError(s.mgr.reconcilePrewarm())
+
+	s.Len(s.speculativeInstances(), prewarmTestCohortLen,
+		"the forecast was bought once and must not be bought again because someone else claimed it")
+}
+
 func (s *PrewarmPoolTestSuite) TestQueuedFanoutJobClaimsPrewarmedCapacity() {
 	s.recordGateJob(1, 100)
 	s.Require().NoError(s.mgr.reconcilePrewarm())

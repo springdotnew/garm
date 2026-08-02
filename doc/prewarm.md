@@ -110,6 +110,13 @@ instead of each sizing itself in isolation. Capacity that is already spoken for
 does not count — otherwise the gate job's own runner would cancel out part of
 the forecast that same job just created.
 
+**A forecast is a budget, not a level.** A pool's capacity is shared, so another
+run's jobs can take the runners this forecast bought; that must not reopen it. No
+request ever creates more than its own target, however the pool got drained
+around it — the difference above is capped by what the request has not already
+paid for. A cohort the global ceiling truncated still finishes later, because
+what is already alive is subtracted as existing capacity rather than as spend.
+
 **Claiming, not reserving twice.** When a fanout job is queued and a matching
 speculative runner exists, GARM hands it to that job instead of creating a
 second one. The claim is a single conditional update, so two jobs racing for the

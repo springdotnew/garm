@@ -472,6 +472,40 @@ func (s *PrewarmTestSuite) TestSumRemainingPrewarmForecast() {
 	s.Require().Equal(uint(4), remaining)
 }
 
+// This sum is the prediction, deliberately blind to how much capacity has been
+// bought against it — which is not the same rule the pool manager reconciles by,
+// and the difference is on purpose.
+//
+// The pool manager caps each pass by what a request has not already paid for,
+// because it sizes passes as `remaining - available` and `available` is
+// pool-wide: without the cap another run's jobs draining the shared pool reopen
+// a forecast this run's own demand never touched. That cap belongs where the
+// buying happens. Mirroring it here would do nothing for a scale-set entity —
+// only the pool path records created counts — while collapsing a scale set's
+// autoscale target to zero on an entity that runs both against one label.
+func (s *PrewarmTestSuite) TestForecastSumIsThePredictionNotTheBudget() {
+	request, _, err := s.store.CreatePrewarmRequest(s.adminCtx, s.createRequestParams())
+	s.Require().NoError(err)
+	s.armRequests()
+
+	remaining, err := s.store.SumRemainingPrewarmForecast(s.adminCtx, s.entity.ID, spotLabelKey)
+	s.Require().NoError(err)
+	s.Require().Equal(uint(5), remaining)
+
+	// Buying the whole cohort leaves the prediction where it was: not one of the
+	// jobs it predicts has arrived yet.
+	s.Require().NoError(s.store.RecordPrewarmInstancesCreated(s.adminCtx, request.ID, spotLabelKey, 5))
+	remaining, err = s.store.SumRemainingPrewarmForecast(s.adminCtx, s.entity.ID, spotLabelKey)
+	s.Require().NoError(err)
+	s.Require().Equal(uint(5), remaining, "buying capacity is not what retires a prediction")
+
+	// Real demand is.
+	s.Require().NoError(s.consume(931, request, spotLabelKey))
+	remaining, err = s.store.SumRemainingPrewarmForecast(s.adminCtx, s.entity.ID, spotLabelKey)
+	s.Require().NoError(err)
+	s.Require().Equal(uint(4), remaining)
+}
+
 func (s *PrewarmTestSuite) TestShadowForecastHoldsNoCapacity() {
 	shadow := s.createRequestParams()
 	shadow.State = params.PrewarmRequestShadow

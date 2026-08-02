@@ -84,11 +84,39 @@ type PrewarmRequestTarget struct {
 // RemainingForecast is the demand still predicted but not yet seen as real
 // queued work. Once GitHub has queued the jobs, they are handled by the
 // ordinary queued-job path and must not be forecast a second time.
+//
+// This is the prediction, deliberately unaware of how much capacity has been
+// bought against it — shadow mode reports it without buying anything at all.
+// What bounds the buying is UnspentBudget below.
 func (p PrewarmRequestTarget) RemainingForecast() uint {
 	if p.ObservedDemand >= p.TargetCount {
 		return 0
 	}
 	return p.TargetCount - p.ObservedDemand
+}
+
+// UnspentBudget is how much of this target's forecast has not been bought yet.
+//
+// A forecast is a budget spent once, not a level held for the length of the
+// window, and this is what is left of it. The reconciler sizes each pass as
+// `remaining forecast - available capacity`, but `available` is pool-wide while
+// the forecast is per-request: when a *different* run's jobs drained the shared
+// pool, a request saw a deficit against a forecast its own demand had never
+// touched, and refilled it. With several pull requests in flight the requests
+// refill each other's consumption and the fleet grows without any of them
+// exceeding its own forecast on paper. Observed in production 2026-08-02: a
+// 10-runner `gcp-8vcpu` target created 22, still buying three minutes after its
+// own run had finished.
+//
+// Capping each pass by this makes `CreatedCount <= TargetCount` an invariant per
+// target, which is the property that bounds the burst — while still letting a
+// cohort that was truncated by the global ceiling finish later, because what is
+// already alive is subtracted through `available` rather than through here.
+func (p PrewarmRequestTarget) UnspentBudget() uint {
+	if p.CreatedCount >= p.TargetCount {
+		return 0
+	}
+	return p.TargetCount - p.CreatedCount
 }
 
 // SpeculativeInstanceParams marks a runner being created as speculative and
@@ -135,6 +163,12 @@ type PrewarmDemand struct {
 	Labels   []string
 	// Remaining is the summed remaining forecast across requests.
 	Remaining uint
+	// Unspent is the summed unbought budget across the same requests, and is
+	// the ceiling on how much one reconcile pass may create. Remaining says how
+	// much work is still predicted; Unspent says how much of it has not already
+	// been paid for. Without the second number a request re-buys whatever any
+	// other run consumes from the shared pool.
+	Unspent uint
 	// RequestIDs are the requests that contributed to Remaining, most recent
 	// first. New capacity is attributed to the first one.
 	RequestIDs []string
