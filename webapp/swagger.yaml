@@ -2505,6 +2505,9 @@ definitions:
         x-go-package: github.com/cloudbase/garm/params
     UpdateScaleSetParams:
         properties:
+            disable_update:
+                type: boolean
+                x-go-name: DisableUpdate
             enable_shell:
                 type: boolean
                 x-go-name: EnableShell
